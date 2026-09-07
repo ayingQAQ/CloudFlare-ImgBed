@@ -136,7 +136,7 @@ async function storageTiering(context) {
 export const onRequest = [
     checkDatabaseConfig,
     handleOptions,
-    storageTiering,
     errorHandling,
+    storageTiering,
     telemetryData,
 ];
