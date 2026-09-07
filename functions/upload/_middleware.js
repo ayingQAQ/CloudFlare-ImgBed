@@ -1,4 +1,5 @@
 import { errorHandling, telemetryData, checkDatabaseConfig } from '../utils/middleware';
+import { refreshTieringIndex } from '../utils/tieringIndex.js';
 import {
     resolveAutomaticPrimary,
     isAutomaticChannelRequest,
@@ -58,6 +59,9 @@ async function storageTiering(context) {
 
     // 分块续传和 merge 必须沿用初始化会话的存储渠道，不能中途切换。
     if (isAutomaticChannelRequest(url) && !isChunkPart && !isMerge) {
+        // 先合并上一次上传留下的索引操作，确保 R2 容量统计尽量实时。
+        await refreshTieringIndex(context);
+
         const decision = await resolveAutomaticPrimary(context, request);
 
         if (!decision.channel) {
