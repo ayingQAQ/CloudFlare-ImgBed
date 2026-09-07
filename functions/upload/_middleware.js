@@ -30,11 +30,10 @@ async function handleOptions(context) {
  * Automatic storage tiering for the main /upload endpoint only.
  *
  * Default policy:
- * - automatic uploads prefer R2
+ * - normal R2 uploads participate in automatic R2 -> Hugging Face tiering
  * - when projected managed R2 usage reaches the safety threshold (95% by default), use Hugging Face
  * - Telegram is never selected as a primary by this policy; it is an asynchronous replica
- *
- * Explicit uploadChannel requests keep the upstream project's behavior.
+ * - API clients can bypass tiering deliberately with ?tiering=off or ?forcePrimary=true
  */
 async function storageTiering(context) {
     const originalRequest = context.request;
@@ -70,7 +69,7 @@ async function storageTiering(context) {
                 success: false,
                 error: decision.reason,
                 message: decision.reason === 'r2_threshold_reached_hf_unavailable'
-                    ? 'R2 已达到安全阈值，但 Hugging Face 未配置或不可用。请配置 Hugging Face，或显式选择 R2 后重试。'
+                    ? 'R2 已达到安全阈值，但 Hugging Face 未配置或不可用。请配置 Hugging Face；如确需强制写入 R2，API 请求可显式使用 tiering=off。'
                     : '没有可用的主存储渠道，请至少配置 R2 或 Hugging Face。',
                 tiering: decision,
             };
