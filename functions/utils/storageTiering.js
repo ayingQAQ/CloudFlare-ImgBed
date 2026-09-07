@@ -5,6 +5,7 @@ import { TelegramAPI } from './storage/telegramAPI.js';
 
 const DEFAULT_R2_FREE_LIMIT_GB = 10;
 const DEFAULT_R2_SWITCH_THRESHOLD = 95;
+const AUTOMATIC_R2_CHUNK_SIZE = 16 * 1024 * 1024;
 const TELEGRAM_BACKUP_CHUNK_SIZE = 16 * 1024 * 1024;
 const TELEGRAM_BACKUP_MAX_CHUNKS = 50;
 const DECIMAL_GB = 1000 * 1000 * 1000;
@@ -74,6 +75,16 @@ async function estimateIncomingBytes(request, url) {
         const file = formdata.get('file');
         if (file && typeof file.size === 'number') {
             return file.size;
+        }
+
+        // The existing frontend does not send originalFileSize when it initializes
+        // an R2 multipart upload. Estimate conservatively from totalChunks so a large
+        // upload cannot start at 94.x% and silently push R2 beyond the 95% safety line.
+        if (url.searchParams.get('initChunked') === 'true') {
+            const totalChunks = Number(formdata.get('totalChunks'));
+            if (Number.isInteger(totalChunks) && totalChunks > 0) {
+                return totalChunks * AUTOMATIC_R2_CHUNK_SIZE;
+            }
         }
     } catch (error) {
         console.warn('Storage tiering: failed to estimate upload size:', error.message);
@@ -166,8 +177,17 @@ export async function resolveAutomaticPrimary(context, request = context.request
 }
 
 export function isAutomaticChannelRequest(url) {
-    const requested = url.searchParams.get('uploadChannel');
-    return !requested || requested === 'auto';
+    const tiering = String(url.searchParams.get('tiering') || '').toLowerCase();
+    const forcePrimary = String(url.searchParams.get('forcePrimary') || '').toLowerCase();
+    if (['off', 'false', '0', 'disabled'].includes(tiering) || forcePrimary === 'true') {
+        return false;
+    }
+
+    const requested = normalizePrimaryChannel(url.searchParams.get('uploadChannel'));
+    // The stock web UI always sends a concrete uploadChannel. Treat its normal R2
+    // selection as the automatic R2->HF tier so the 95% switch actually works.
+    // API clients can still force R2 with ?tiering=off (or ?forcePrimary=true).
+    return !requested || requested === 'auto' || requested === 'cfr2';
 }
 
 export function shouldScheduleTelegramBackup(primaryChannel, url) {
@@ -294,6 +314,9 @@ async function createPrimarySource(context, fileId, primaryChannel, uploadConfig
             fileName,
             contentType: head.httpMetadata?.contentType || contentType,
             async readSlice(start, end) {
+                if (end <= start) {
+                    return new Blob([], { type: head.httpMetadata?.contentType || contentType });
+                }
                 const object = await context.env.img_r2.get(fileId, {
                     range: { offset: start, length: end - start },
                 });
@@ -329,6 +352,9 @@ async function createPrimarySource(context, fileId, primaryChannel, uploadConfig
             fileName,
             contentType,
             async readSlice(start, end) {
+                if (end <= start) {
+                    return new Blob([], { type: contentType });
+                }
                 const headers = {
                     Authorization: `Bearer ${hfChannel.token}`,
                     Range: `bytes=${start}-${end - 1}`,
