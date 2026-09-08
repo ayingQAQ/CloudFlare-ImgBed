@@ -51,6 +51,7 @@ import * as uploadHuggingfaceGetUploadUrl from '../../functions/upload/huggingfa
 import * as apiChannels from '../../functions/api/channels.js';
 import * as apiDirectoryTree from '../../functions/api/directoryTree.js';
 import * as apiFetchRes from '../../functions/api/fetchRes.js';
+import * as apiSiteStats from '../../functions/api/siteStats.js';
 import * as apiTelegramBackupRun from '../../functions/api/telegramBackupRun.js';
 import * as apiUserConfig from '../../functions/api/userConfig.js';
 import * as random_index from '../../functions/random/index.js';
@@ -105,6 +106,7 @@ const routes = [
     { path: '/api/channels', module: apiChannels, middlewares: [mw_api] },
     { path: '/api/directoryTree', module: apiDirectoryTree, middlewares: [mw_api] },
     { path: '/api/fetchRes', module: apiFetchRes, middlewares: [mw_api] },
+    { path: '/api/siteStats', module: apiSiteStats, middlewares: [mw_api] },
     { path: '/api/telegramBackupRun', module: apiTelegramBackupRun, middlewares: [mw_api] },
     { path: '/api/userConfig', module: apiUserConfig, middlewares: [mw_api] },
     { path: '/random', module: random_index, middlewares: [mw_random] },
