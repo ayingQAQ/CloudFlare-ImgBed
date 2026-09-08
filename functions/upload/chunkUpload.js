@@ -5,6 +5,7 @@ import { DiscordAPI } from '../utils/storage/discordAPI';
 import { S3Client, CreateMultipartUploadCommand, UploadPartCommand, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { getDatabase, checkDatabaseConfig } from '../utils/databaseAdapter.js';
 import { fetchPageConfig } from '../utils/sysConfig.js';
+import { attachR2Multipart } from '../utils/r2Capacity.js';
 
 // 初始化分块上传
 export async function initializeChunkedUpload(context) {
@@ -48,6 +49,7 @@ export async function initializeChunkedUpload(context) {
             totalChunks,
             uploadChannel,
             channelName,
+            tieringReservation: url.searchParams.get('tieringReservation') || undefined,
             uploadIp,
             ipAddress,
             status: 'initialized',
@@ -384,10 +386,15 @@ async function uploadSingleChunkToR2Multipart(context, chunkData, chunkIndex, to
             finalFileId = await buildUniqueFileId(context, originalFileName, originalFileType);
 
             const multipartUpload = await R2DataBase.createMultipartUpload(finalFileId);
-            const multipartInfo = {
+            let multipartInfo = {
                 uploadId: multipartUpload.uploadId,
                 key: finalFileId
             };
+            const reservation = context.url.searchParams.get('tieringReservation');
+            if (reservation) {
+                multipartInfo = await attachR2Multipart(R2DataBase, reservation, multipartInfo);
+                finalFileId = multipartInfo.key;
+            }
 
             // 保存multipart info
             await db.put(multipartKey, JSON.stringify(multipartInfo), {

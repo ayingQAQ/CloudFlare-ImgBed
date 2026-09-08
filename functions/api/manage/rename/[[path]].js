@@ -1,3 +1,4 @@
+import { relocateTelegramBackup } from '../../../utils/telegramBackup.js';
 import { S3Client, CopyObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { purgeCFCache, purgeRandomFileListCache, purgePublicFileListCache } from "../../../utils/purgeCache";
 import { moveFileInIndex } from "../../../utils/indexManager.js";
@@ -167,6 +168,7 @@ export async function onRequest(context) {
 
         // 更新 KV 存储
         await db.put(newFileId, fileData.value, { metadata });
+        await relocateTelegramBackup(env, newFileId, metadata);
         await db.delete(fileId);
 
         // 清除 CDN 缓存

@@ -7,6 +7,7 @@
 import { HuggingFaceAPI } from '../../utils/storage/huggingfaceAPI.js';
 import { fetchPageConfig, fetchUploadConfig } from '../../utils/sysConfig.js';
 import { getDatabase } from '../../utils/databaseAdapter.js';
+import { backupFileIdToTelegram } from '../../utils/storageTiering.js';
 import { moderateContent, endUpload, getUploadIp, getIPAddress, sanitizeUploadFolder, createResponse } from '../uploadTools.js';
 import { userAuthCheck, UnauthorizedResponse } from '../../utils/auth/userAuth.js';
 
@@ -96,6 +97,7 @@ export async function onRequestPost(context) {
 
         // 构建 metadata
         const metadata = {
+            BackupId: crypto.randomUUID(),
             FileName: fileName || fullId,
             FileType: fileType || '',
             Channel: "HuggingFace",
@@ -133,6 +135,10 @@ export async function onRequestPost(context) {
             url
         };
         waitUntil(endUpload(uploadContext, fullId, metadata));
+
+        // HF 大文件是浏览器直传，不经过 /upload 的主文件请求。
+        // 在提交成功并持久化元数据后，从 HF 分片读取并异步备份到 Telegram。
+        await backupFileIdToTelegram(context, fullId, 'huggingface');
 
         // 返回成功响应
         const returnLink = `/file/${fullId}`;

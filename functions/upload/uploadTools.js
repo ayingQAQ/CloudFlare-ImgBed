@@ -149,6 +149,11 @@ export function sanitizeUploadFolder(folder) {
     // 替换反斜杠为正斜杠
     folder = folder.replace(/\\/g, '/');
 
+    // Reserved for capacity reservations and private backup manifests.
+    if (folder.split('/').includes('.imgbed-internal')) {
+        throw new Error('Reserved upload directory');
+    }
+
     // 将连续斜杠替换为单个斜杠
     folder = folder.replace(/\/{2,}/g, '/');
 

@@ -24,6 +24,12 @@ export async function onRequest(context) {
         }
     }
 
+    // Tiered-storage fork default: the stock frontend otherwise falls back to Telegram.
+    // Keep an explicitly configured default untouched, but make fresh deployments prefer R2.
+    if (!userConfig.defaultUploadChannel) {
+        userConfig.defaultUploadChannel = 'cfr2';
+    }
+
     if (Number.isFinite(Number(PageConfig.announcementRefreshAt))) {
         userConfig.announcementRefreshAt = Number(PageConfig.announcementRefreshAt);
     }

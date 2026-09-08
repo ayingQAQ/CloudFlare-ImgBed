@@ -1,4 +1,5 @@
 import { S3Client, CopyObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { relocateTelegramBackup } from '../../../utils/telegramBackup.js';
 import { purgeCFCache, purgeRandomFileListCache, purgePublicFileListCache } from "../../../utils/purgeCache";
 import { moveFileInIndex, batchMoveFilesInIndex } from "../../../utils/indexManager.js";
 import { getDatabase } from '../../../utils/databaseAdapter.js';
@@ -183,6 +184,7 @@ async function moveFile(env, fileId, newFileId, cdnUrl, url) {
 
         // 更新KV存储
         await db.put(newFileId, img.value, { metadata: img.metadata });
+        await relocateTelegramBackup(env, newFileId, img.metadata);
         await db.delete(fileId);
 
         // 清除CDN缓存
