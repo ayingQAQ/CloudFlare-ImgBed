@@ -1,0 +1,21 @@
+name: Storage tiering regression tests
+on:
+  pull_request:
+  push:
+    branches: [main, feature/r2-hf-tg-storage-tiering]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run test:storage
+      - run: node deploy/worker/generate-routes.js
+      - run: git diff --exit-code -- deploy/worker/index.js
+      - run: npx wrangler deploy --dry-run --config deploy/worker/wrangler.toml

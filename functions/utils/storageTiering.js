@@ -1,13 +1,11 @@
 import { fetchUploadConfig } from './sysConfig.js';
-import { getIndexMeta, addFileToIndex } from './indexManager.js';
+import { reserveR2 } from './r2Capacity.js';
 import { getDatabase } from './databaseAdapter.js';
-import { TelegramAPI } from './storage/telegramAPI.js';
+export { enqueueTelegramBackup as backupFileIdToTelegram } from './telegramBackup.js';
 
 const DEFAULT_R2_FREE_LIMIT_GB = 10;
 const DEFAULT_R2_SWITCH_THRESHOLD = 95;
 const AUTOMATIC_R2_CHUNK_SIZE = 16 * 1024 * 1024;
-const TELEGRAM_BACKUP_CHUNK_SIZE = 16 * 1024 * 1024;
-const TELEGRAM_BACKUP_MAX_CHUNKS = 50;
 const DECIMAL_GB = 1000 * 1000 * 1000;
 const BINARY_MB = 1024 * 1024;
 
@@ -61,6 +59,8 @@ async function estimateIncomingBytes(request, url) {
 
     try {
         const formdata = await request.clone().formData();
+        const actualFile = formdata.get('file');
+        if (actualFile && typeof actualFile.size === 'number') return actualFile.size;
         const sizeFields = ['originalFileSize', 'fileSizeBytes', 'totalSize', 'fileSize'];
         for (const key of sizeFields) {
             const value = Number(formdata.get(key));
@@ -93,87 +93,22 @@ async function estimateIncomingBytes(request, url) {
     return 0;
 }
 
-function calculateR2UsedBytes(indexMeta, r2Channels) {
-    const channelStats = indexMeta?.channelStats || {};
-    const r2Names = new Set((r2Channels || []).map(channel => channel?.name).filter(Boolean));
-    r2Names.add('R2_env');
-
-    let usedMB = 0;
-    for (const [channelName, stats] of Object.entries(channelStats)) {
-        if (r2Names.has(channelName)) {
-            usedMB += Number(stats?.usedMB) || 0;
-        }
-    }
-    return usedMB * BINARY_MB;
-}
-
 export async function resolveAutomaticPrimary(context, request = context.request) {
-    const { env } = context;
-    const url = new URL(request.url);
-    const uploadConfig = await fetchUploadConfig(env, context);
-    const r2Channels = uploadConfig?.cfr2?.channels || [];
-    const hfChannels = uploadConfig?.huggingface?.channels || [];
-    const hasR2 = Boolean(env.img_r2) && r2Channels.length > 0;
-    const hasHF = hfChannels.length > 0;
-
-    if (!hasR2 && hasHF) {
-        return { channel: 'huggingface', reason: 'r2_unavailable', r2UsagePercent: null };
+    const config = await fetchUploadConfig(context.env);
+    const r2 = config.cfr2?.channels || [];
+    const hf = config.huggingface?.channels || [];
+    const policy = getTieringPolicy(context.env, r2);
+    const incomingBytes = Math.ceil(await estimateIncomingBytes(request, new URL(request.url)));
+    if (context.env.img_r2 && r2.length) {
+        const reservation = await reserveR2(context.env.img_r2, incomingBytes,
+            policy.limitBytes * policy.threshold / 100,
+            new URL(request.url).searchParams.get('initChunked') === 'true' ? 2 * 3600000 : 24 * 3600000);
+        if (reservation.id) return { channel: 'cfr2', reservationId: reservation.id, incomingBytes };
+        return { channel: hf.length ? 'huggingface' : null,
+            reason: hf.length ? 'r2_threshold_reached' : 'r2_threshold_reached_hf_unavailable',
+            ...reservation, incomingBytes, threshold: policy.threshold, limitGB: policy.limitGB };
     }
-
-    if (!hasR2 && !hasHF) {
-        return { channel: null, reason: 'no_primary_storage', r2UsagePercent: null };
-    }
-
-    const policy = getTieringPolicy(env, r2Channels);
-    const indexMeta = await getIndexMeta(context);
-    const usedBytes = calculateR2UsedBytes(indexMeta, r2Channels);
-    const incomingBytes = await estimateIncomingBytes(request, url);
-    const projectedBytes = usedBytes + incomingBytes;
-    const usagePercent = policy.limitBytes > 0 ? (usedBytes / policy.limitBytes) * 100 : 0;
-    const projectedPercent = policy.limitBytes > 0 ? (projectedBytes / policy.limitBytes) * 100 : 0;
-
-    if (projectedPercent < policy.threshold) {
-        return {
-            channel: 'cfr2',
-            reason: 'r2_below_threshold',
-            usedBytes,
-            incomingBytes,
-            projectedBytes,
-            r2UsagePercent: usagePercent,
-            projectedPercent,
-            threshold: policy.threshold,
-            limitGB: policy.limitGB,
-            usageSource: 'imgbed_index',
-        };
-    }
-
-    if (hasHF) {
-        return {
-            channel: 'huggingface',
-            reason: 'r2_threshold_reached',
-            usedBytes,
-            incomingBytes,
-            projectedBytes,
-            r2UsagePercent: usagePercent,
-            projectedPercent,
-            threshold: policy.threshold,
-            limitGB: policy.limitGB,
-            usageSource: 'imgbed_index',
-        };
-    }
-
-    return {
-        channel: null,
-        reason: 'r2_threshold_reached_hf_unavailable',
-        usedBytes,
-        incomingBytes,
-        projectedBytes,
-        r2UsagePercent: usagePercent,
-        projectedPercent,
-        threshold: policy.threshold,
-        limitGB: policy.limitGB,
-        usageSource: 'imgbed_index',
-    };
+    return { channel: hf.length ? 'huggingface' : null, reason: hf.length ? 'r2_unavailable' : 'no_primary_storage' };
 }
 
 export function isAutomaticChannelRequest(url) {
@@ -243,255 +178,5 @@ export async function extractUploadedFileId(response) {
     } catch (error) {
         console.warn('Telegram backup: failed to parse upload response:', error.message);
         return '';
-    }
-}
-
-async function updateTelegramReplicaMetadata(context, fileId, patch) {
-    const db = getDatabase(context.env);
-    const record = await db.getWithMetadata(fileId);
-    if (!record) return null;
-
-    const metadata = record.metadata || {};
-    const replicas = metadata.Replicas && typeof metadata.Replicas === 'object'
-        ? { ...metadata.Replicas }
-        : {};
-
-    replicas.telegram = {
-        ...(replicas.telegram || {}),
-        ...patch,
-        updatedAt: Date.now(),
-    };
-
-    const updatedMetadata = { ...metadata, Replicas: replicas };
-    await db.put(fileId, record.value ?? '', { metadata: updatedMetadata });
-
-    if (patch.status === 'ready' || patch.status === 'failed' || patch.status === 'not_configured') {
-        await addFileToIndex(context, fileId, updatedMetadata);
-    }
-
-    return updatedMetadata;
-}
-
-function selectTelegramBackupChannel(uploadConfig, env) {
-    const channels = uploadConfig?.telegram?.channels || [];
-    if (channels.length === 0) return null;
-
-    const preferredName = env.TG_BACKUP_CHANNEL_NAME;
-    if (preferredName) {
-        const preferred = channels.find(channel => channel.name === preferredName);
-        if (preferred) return preferred;
-    }
-    return channels[0];
-}
-
-function encodePath(path) {
-    return String(path || '')
-        .split('/')
-        .map(part => encodeURIComponent(part))
-        .join('/');
-}
-
-function selectHuggingFaceChannel(uploadConfig, channelName) {
-    const channels = uploadConfig?.huggingface?.channels || [];
-    return channels.find(channel => channel.name === channelName) || channels[0] || null;
-}
-
-async function createPrimarySource(context, fileId, primaryChannel, uploadConfig) {
-    const normalizedPrimary = normalizePrimaryChannel(primaryChannel);
-    const db = getDatabase(context.env);
-    const record = await db.getWithMetadata(fileId);
-    const metadata = record?.metadata || {};
-    const fileName = metadata.FileName || fileId.split('/').pop() || 'backup.bin';
-    const contentType = metadata.FileType || 'application/octet-stream';
-
-    if (normalizedPrimary === 'cfr2' && context.env.img_r2) {
-        const head = await context.env.img_r2.head(fileId);
-        if (!head) return null;
-
-        const size = Number(head.size) || Number(metadata.FileSizeBytes) || 0;
-        return {
-            size,
-            fileName,
-            contentType: head.httpMetadata?.contentType || contentType,
-            async readSlice(start, end) {
-                if (end <= start) {
-                    return new Blob([], { type: head.httpMetadata?.contentType || contentType });
-                }
-                const object = await context.env.img_r2.get(fileId, {
-                    range: { offset: start, length: end - start },
-                });
-                if (!object) throw new Error('R2 source object disappeared during Telegram backup');
-                const bytes = await object.arrayBuffer();
-                return new Blob([bytes], { type: head.httpMetadata?.contentType || contentType });
-            },
-        };
-    }
-
-    if (normalizedPrimary === 'huggingface') {
-        const hfPath = metadata.HfFilePath;
-        const hfChannel = selectHuggingFaceChannel(uploadConfig, metadata.ChannelName);
-        if (!hfPath || !hfChannel?.repo || !hfChannel?.token) return null;
-
-        const repo = hfChannel.repo.split('/').map(encodeURIComponent).join('/');
-        const fileUrl = `https://huggingface.co/datasets/${repo}/resolve/main/${encodePath(hfPath)}`;
-        let size = Number(metadata.FileSizeBytes) || 0;
-
-        if (!size) {
-            const headResponse = await fetch(fileUrl, {
-                method: 'HEAD',
-                headers: { Authorization: `Bearer ${hfChannel.token}` },
-            });
-            if (!headResponse.ok) {
-                throw new Error(`Unable to read Hugging Face backup source metadata: ${headResponse.status}`);
-            }
-            size = Number(headResponse.headers.get('content-length')) || 0;
-        }
-
-        return {
-            size,
-            fileName,
-            contentType,
-            async readSlice(start, end) {
-                if (end <= start) {
-                    return new Blob([], { type: contentType });
-                }
-                const headers = {
-                    Authorization: `Bearer ${hfChannel.token}`,
-                    Range: `bytes=${start}-${end - 1}`,
-                };
-                const response = await fetch(fileUrl, { headers });
-                const isWholeFileRequest = start === 0 && end >= size;
-                if (!response.ok || (!isWholeFileRequest && response.status !== 206)) {
-                    throw new Error(`Hugging Face range read failed: ${response.status}`);
-                }
-                return await response.blob();
-            },
-        };
-    }
-
-    return null;
-}
-
-async function sendTelegramDocumentWithRetry(api, chatId, blob, fileName, caption, maxAttempts = 3) {
-    let lastError = null;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-            const response = await api.sendFile(blob, chatId, 'sendDocument', 'document', caption, fileName);
-            const info = api.getFileInfo(response);
-            if (!info?.file_id) throw new Error('Telegram did not return a document file_id');
-            return {
-                fileId: info.file_id,
-                fileName: info.file_name || fileName,
-                size: Number(info.file_size) || Number(blob.size) || 0,
-            };
-        } catch (error) {
-            lastError = error;
-            if (attempt < maxAttempts) {
-                await new Promise(resolve => setTimeout(resolve, Math.min(500 * (2 ** (attempt - 1)), 2000)));
-            }
-        }
-    }
-    throw lastError || new Error('Telegram backup failed');
-}
-
-async function uploadPrimarySourceToTelegram(source, channel) {
-    const api = new TelegramAPI(channel.botToken, channel.proxyUrl || '');
-    const chatId = channel.chatId;
-    const fileSize = Number(source.size) || 0;
-    const totalChunks = Math.max(1, Math.ceil(fileSize / TELEGRAM_BACKUP_CHUNK_SIZE));
-
-    if (totalChunks > TELEGRAM_BACKUP_MAX_CHUNKS) {
-        throw new Error(`Telegram backup exceeds ${TELEGRAM_BACKUP_MAX_CHUNKS} x 16MB chunk safety limit`);
-    }
-
-    if (totalChunks === 1) {
-        const blob = await source.readSlice(0, fileSize);
-        const uploaded = await sendTelegramDocumentWithRetry(
-            api,
-            chatId,
-            blob,
-            source.fileName,
-            'ImgBed backup'
-        );
-        return {
-            chunked: false,
-            fileId: uploaded.fileId,
-            sizeBytes: uploaded.size,
-        };
-    }
-
-    const chunks = [];
-    for (let index = 0; index < totalChunks; index++) {
-        const start = index * TELEGRAM_BACKUP_CHUNK_SIZE;
-        const end = Math.min(start + TELEGRAM_BACKUP_CHUNK_SIZE, fileSize);
-        const blob = await source.readSlice(start, end);
-        const chunkName = `${source.fileName}.part${String(index).padStart(3, '0')}`;
-        const uploaded = await sendTelegramDocumentWithRetry(
-            api,
-            chatId,
-            blob,
-            chunkName,
-            `ImgBed backup ${index + 1}/${totalChunks}`
-        );
-        chunks.push({
-            index,
-            fileId: uploaded.fileId,
-            size: uploaded.size,
-            fileName: chunkName,
-        });
-    }
-
-    return {
-        chunked: true,
-        totalChunks,
-        sizeBytes: fileSize,
-        chunks,
-    };
-}
-
-export async function backupFileIdToTelegram(context, fileId, primaryChannel) {
-    const normalizedPrimary = normalizePrimaryChannel(primaryChannel);
-    if (!fileId || normalizedPrimary === 'telegram' || normalizedPrimary === 'external' || !normalizedPrimary) return;
-
-    const uploadConfig = await fetchUploadConfig(context.env, context);
-    const tgChannel = selectTelegramBackupChannel(uploadConfig, context.env);
-    if (!tgChannel?.botToken || !tgChannel?.chatId) {
-        await updateTelegramReplicaMetadata(context, fileId, {
-            status: 'not_configured',
-            primaryChannel: normalizedPrimary,
-        });
-        return;
-    }
-
-    await updateTelegramReplicaMetadata(context, fileId, {
-        status: 'pending',
-        channelName: tgChannel.name,
-        primaryChannel: normalizedPrimary,
-        lastError: null,
-    });
-
-    try {
-        const source = await createPrimarySource(context, fileId, normalizedPrimary, uploadConfig);
-        if (!source || !Number.isFinite(Number(source.size)) || Number(source.size) < 0) {
-            throw new Error(`Unable to load source bytes for primary channel: ${normalizedPrimary}`);
-        }
-
-        const result = await uploadPrimarySourceToTelegram(source, tgChannel);
-        await updateTelegramReplicaMetadata(context, fileId, {
-            status: 'ready',
-            channelName: tgChannel.name,
-            primaryChannel: normalizedPrimary,
-            backedUpAt: Date.now(),
-            lastError: null,
-            ...result,
-        });
-    } catch (error) {
-        console.error(`Telegram backup failed for ${fileId}:`, error.message);
-        await updateTelegramReplicaMetadata(context, fileId, {
-            status: 'failed',
-            channelName: tgChannel.name,
-            primaryChannel: normalizedPrimary,
-            lastError: String(error.message || error).slice(0, 500),
-        });
     }
 }

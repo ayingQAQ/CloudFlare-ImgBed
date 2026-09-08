@@ -7,7 +7,7 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, readdir
 import { dirname, join } from 'path';
 import { createReadStream } from 'fs';
 import { Readable } from 'stream';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 
 export class LocalR2Storage {
     constructor(basePath) {
@@ -19,6 +19,33 @@ export class LocalR2Storage {
         return join(this.basePath, key);
     }
 
+    async head(key) {
+        const path = this._filePath(key);
+        if (!existsSync(path)) return null;
+        const stat = statSync(path);
+        const etag = key.startsWith('.imgbed-internal/')
+            ? createHash('sha256').update(readFileSync(path)).digest('hex')
+            : `${stat.ino}-${stat.size}-${stat.mtimeMs}`;
+        return { key, size: stat.size, etag, httpMetadata: {} };
+    }
+
+    async list({ prefix = '', cursor = '', limit = 1000 } = {}) {
+        const keys = [];
+        const walk = (dir, base = '') => {
+            for (const item of readdirSync(dir, { withFileTypes: true })) {
+                if (!base && item.name === '_multipart') continue;
+                const key = base + item.name;
+                if (item.isDirectory()) walk(join(dir, item.name), key + '/');
+                else if (key.startsWith(prefix) && key > cursor) keys.push(key);
+            }
+        };
+        walk(this.basePath);
+        keys.sort();
+        const page = keys.slice(0, limit);
+        return { objects: await Promise.all(page.map(key => this.head(key))),
+            truncated: keys.length > limit, cursor: page.at(-1) };
+    }
+
     /**
      * 获取文件（模拟 R2 的 get 方法）
      * 支持 Range 请求
@@ -28,6 +55,10 @@ export class LocalR2Storage {
         if (!existsSync(filePath)) return null;
 
         const stats = statSync(filePath);
+        const metadata = await this.head(key);
+        if (options?.onlyIf?.etagMatches && metadata.etag !== options.onlyIf.etagMatches) {
+            return metadata;
+        }
         const size = stats.size;
         let body;
         let range;
@@ -45,6 +76,7 @@ export class LocalR2Storage {
         }
 
         return {
+            ...metadata,
             body,
             size,
             range,
@@ -59,7 +91,7 @@ export class LocalR2Storage {
      * 存储文件（模拟 R2 的 put 方法）
      * 支持多种输入类型
      */
-    async put(key, value) {
+    async put(key, value, options = {}) {
         const filePath = this._filePath(key);
         mkdirSync(dirname(filePath), { recursive: true });
 
@@ -85,7 +117,16 @@ export class LocalR2Storage {
             buffer = Buffer.from(String(value), 'utf-8');
         }
 
+        // The comparison and write are synchronous: atomic within the Docker process.
+        const condition = options.onlyIf;
+        if (condition) {
+            const present = existsSync(filePath);
+            const etag = present ? createHash('sha256').update(readFileSync(filePath)).digest('hex') : null;
+            if (condition.etagMatches && etag !== condition.etagMatches) return null;
+            if (condition.etagDoesNotMatch === '*' && present) return null;
+        }
         writeFileSync(filePath, buffer);
+        return this.head(key);
     }
 
     /**

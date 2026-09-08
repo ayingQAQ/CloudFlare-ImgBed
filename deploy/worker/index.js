@@ -43,6 +43,7 @@ import * as apiBingWallpaper_index from '../../functions/api/bing/wallpaper/inde
 import * as apiManageApiTokens from '../../functions/api/manage/apiTokens.js';
 import * as apiManageList from '../../functions/api/manage/list.js';
 import * as apiManageQuota from '../../functions/api/manage/quota.js';
+import * as apiManageTelegramBackup from '../../functions/api/manage/telegramBackup.js';
 import * as apiPublicList from '../../functions/api/public/list.js';
 import * as uploadHuggingfaceCommitUpload from '../../functions/upload/huggingface/commitUpload.js';
 import * as uploadHuggingfaceCompleteMultipart from '../../functions/upload/huggingface/completeMultipart.js';
@@ -50,6 +51,7 @@ import * as uploadHuggingfaceGetUploadUrl from '../../functions/upload/huggingfa
 import * as apiChannels from '../../functions/api/channels.js';
 import * as apiDirectoryTree from '../../functions/api/directoryTree.js';
 import * as apiFetchRes from '../../functions/api/fetchRes.js';
+import * as apiTelegramBackupRun from '../../functions/api/telegramBackupRun.js';
 import * as apiUserConfig from '../../functions/api/userConfig.js';
 import * as random_index from '../../functions/random/index.js';
 import * as upload_index from '../../functions/upload/index.js';
@@ -63,6 +65,7 @@ import * as apiManageWhiteCatchAll from '../../functions/api/manage/white/[[path
 import * as davCatchAll from '../../functions/dav/[[path]].js';
 import * as fileCatchAll from '../../functions/file/[[path]].js';
 
+import { drainTelegramBackups } from '../../functions/utils/telegramBackup.js';
 
 // ==================== 自动生成的路由表 ====================
 
@@ -94,6 +97,7 @@ const routes = [
     { path: '/api/manage/apiTokens', module: apiManageApiTokens, middlewares: [mw_api, mw_api_manage] },
     { path: '/api/manage/list', module: apiManageList, middlewares: [mw_api, mw_api_manage] },
     { path: '/api/manage/quota', module: apiManageQuota, middlewares: [mw_api, mw_api_manage] },
+    { path: '/api/manage/telegramBackup', module: apiManageTelegramBackup, middlewares: [mw_api, mw_api_manage] },
     { path: '/api/public/list', module: apiPublicList, middlewares: [mw_api] },
     { path: '/upload/huggingface/commitUpload', module: uploadHuggingfaceCommitUpload, middlewares: [mw_upload] },
     { path: '/upload/huggingface/completeMultipart', module: uploadHuggingfaceCompleteMultipart, middlewares: [mw_upload] },
@@ -101,6 +105,7 @@ const routes = [
     { path: '/api/channels', module: apiChannels, middlewares: [mw_api] },
     { path: '/api/directoryTree', module: apiDirectoryTree, middlewares: [mw_api] },
     { path: '/api/fetchRes', module: apiFetchRes, middlewares: [mw_api] },
+    { path: '/api/telegramBackupRun', module: apiTelegramBackupRun, middlewares: [mw_api] },
     { path: '/api/userConfig', module: apiUserConfig, middlewares: [mw_api] },
     { path: '/random', module: random_index, middlewares: [mw_random] },
     { path: '/upload', module: upload_index, middlewares: [mw_upload] },
@@ -287,6 +292,9 @@ async function maybeServeFromCache(request, ctx, producer) {
 // ==================== Worker 入口 ====================
 
 export default {
+    async scheduled(event, env, ctx) {
+        ctx.waitUntil(drainTelegramBackups(env));
+    },
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
         const pathname = url.pathname;

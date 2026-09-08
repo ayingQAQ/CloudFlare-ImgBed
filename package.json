@@ -9,10 +9,11 @@
   "scripts": {
     "ci-test": "concurrently --kill-others \"npm start\" \"wait-on http://localhost:8080 && mocha\"",
     "ci-test:docker": "concurrently --kill-others \"npm run start:docker\" \"wait-on http://localhost:8080 && mocha\"",
-    "test": "mocha",
+    "test": "npm run test:storage",
     "start": "npx wrangler pages dev ./frontend-dist --kv \"img_url\" --r2 \"img_r2\" --ip 0.0.0.0 --port 8080 --persist-to ./data",
     "start:docker": "node --import ./deploy/server/register.mjs deploy/server/index.js",
-    "deploy:worker": "node deploy/worker/generate-routes.js && npx wrangler deploy --config deploy/worker/wrangler.toml"
+    "deploy:worker": "node deploy/worker/generate-routes.js && npx wrangler deploy --config deploy/worker/wrangler.toml",
+    "test:storage": "node --import ./deploy/server/register.mjs --test test/storage-tiering.test.mjs"
   },
   "overrides": {
     "fast-xml-parser": "^5.3.6"

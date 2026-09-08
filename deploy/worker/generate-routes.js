@@ -209,6 +209,7 @@ const output = `/**
 // ==================== 自动生成的导入 ====================
 
 ${imports}
+import { drainTelegramBackups } from '../../functions/utils/telegramBackup.js';
 
 // ==================== 自动生成的路由表 ====================
 
@@ -387,6 +388,9 @@ async function maybeServeFromCache(request, ctx, producer) {
 // ==================== Worker 入口 ====================
 
 export default {
+    async scheduled(event, env, ctx) {
+        ctx.waitUntil(drainTelegramBackups(env));
+    },
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
         const pathname = url.pathname;

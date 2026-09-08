@@ -1,3 +1,4 @@
+import { drainTelegramBackups } from '../../functions/utils/telegramBackup.js';
 /**
  * Docker 模式下的原生 Node.js 服务器
  * 使用 Hono 作为 Web 框架，代理 Cloudflare Pages Functions 请求
@@ -224,7 +225,10 @@ async function executeChain(middlewares, handler, context) {
     const chain = [...middlewares, handler];
     let index = 0;
 
-    context.next = async function () {
+    context.next = async function (input, init) {
+        if (input !== undefined) {
+            context.request = input instanceof Request && !init ? input : new Request(input, init);
+        }
         if (index < chain.length) {
             const fn = chain[index++];
             return await fn(context);
@@ -393,6 +397,16 @@ app.get('*', async (c) => {
     }
     return c.text('Not Found', 404);
 });
+
+// One process owns the local R2 adapter; skip overlapping timer runs.
+let backupRunning = false;
+setInterval(async () => {
+    if (backupRunning) return;
+    backupRunning = true;
+    try { await drainTelegramBackups(createEnv()); }
+    catch (error) { console.error('Backup worker:', error.message); }
+    finally { backupRunning = false; }
+}, 60000).unref();
 
 // ==================== 启动服务器 ====================
 

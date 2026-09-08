@@ -1,4 +1,5 @@
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { readTelegramBackup } from '../utils/telegramBackup.js';
 import { fetchSecurityConfig } from "../utils/sysConfig";
 import { TelegramAPI } from "../utils/storage/telegramAPI";
 import { DiscordAPI } from "../utils/storage/discordAPI";
@@ -108,7 +109,8 @@ export async function onRequest(context) {  // Contents of context object
 
     /* Cloudflare R2渠道 */
     if (imgRecord.metadata?.Channel === 'CloudflareR2') {
-        const response = await handleR2File(context, fileId, encodedFileName, fileType);
+        const response = await withTelegramFallback(context, fileId, imgRecord.metadata,
+            () => handleR2File(context, fileId, encodedFileName, fileType));
         return await transformImageResponse(context, response);
     }
 
@@ -131,7 +133,8 @@ export async function onRequest(context) {  // Contents of context object
 
     /* HuggingFace 渠道 */
     if (imgRecord.metadata?.Channel === 'HuggingFace') {
-        const response = await handleHuggingFaceFile(context, imgRecord.metadata, encodedFileName, fileType);
+        const response = await withTelegramFallback(context, fileId, imgRecord.metadata,
+            () => handleHuggingFaceFile(context, imgRecord.metadata, encodedFileName, fileType));
         return await transformImageResponse(context, response);
     }
 
@@ -1113,4 +1116,18 @@ function getWebDAVPublicFileUrl(webdavCredentials, filePath) {
     }
 
     return '';
+}
+
+// Called only after the existing authentication, moderation and domain checks.
+async function withTelegramFallback(context, fileId, metadata, loadPrimary) {
+    let response;
+    try { response = await loadPrimary(); }
+    catch { response = new Response('Primary storage unavailable', { status: 502 }); }
+    if (response.status === 404 || response.status >= 500) {
+        try {
+            const replica = await readTelegramBackup(context.env, fileId, metadata, context.request);
+            if (replica) { await response.body?.cancel(); return replica; }
+        } catch (error) { console.warn('Telegram fallback unavailable:', error.message); }
+    }
+    return response;
 }

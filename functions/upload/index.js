@@ -167,6 +167,7 @@ async function processFileUpload(context, formdata = null) {
     const normalizedFolder = uploadFolder;
 
     const metadata = {
+        BackupId: crypto.randomUUID(),
         FileName: fileName,
         FileType: fileType,
         FileSize: fileSize,

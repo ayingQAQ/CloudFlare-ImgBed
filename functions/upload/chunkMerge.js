@@ -161,6 +161,7 @@ async function handleChannelBasedMerge(context, uploadId, totalChunks, originalF
 
         // 构建基础metadata
         const metadata = {
+            BackupId: crypto.randomUUID(),
             FileName: originalFileName,
             FileType: originalFileType,
             FileSize: '0', // 会在最终合并后更新
