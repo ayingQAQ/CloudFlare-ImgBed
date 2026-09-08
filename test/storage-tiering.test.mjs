@@ -14,10 +14,10 @@ import { onRequest as middleware } from '../functions/upload/_middleware.js';
 import { sanitizeUploadFolder } from '../functions/upload/uploadTools.js';
 
 const MB = 1024 * 1024;
-function local(t) {
-    const path = mkdtempSync(join(tmpdir(), 'imgbed-tiering-'));
+function local(t, baseDirectory = tmpdir()) {
+    const path = mkdtempSync(join(baseDirectory, '.imgbed-tiering-'));
     t.after(() => {
-        assert.equal(dirname(path), tmpdir());
+        assert.equal(dirname(path), baseDirectory);
         rmSync(path, { recursive: true });
     });
     return new LocalR2Storage(path);
@@ -259,7 +259,9 @@ test('backup above 800MiB starts and manifests larger than 1KB remain durable', 
 });
 
 test('compiled Pages endpoint uploads to R2, serves exact bytes and completes Telegram backup', async t => {
-    const output = local(t).basePath;
+    // workerd on Linux rejects a script path that escapes its starting directory.
+    // Keep the generated Pages bundle inside the repository for this integration test.
+    const output = local(t, process.cwd()).basePath;
     execFileSync(process.execPath, ['node_modules/wrangler/bin/wrangler.js', 'pages', 'functions', 'build',
         'functions', '--outdir', output], { stdio: 'pipe', env: { ...process.env, WRANGLER_SEND_METRICS: 'false' } });
     const agent = createFetchMock(); agent.disableNetConnect();
