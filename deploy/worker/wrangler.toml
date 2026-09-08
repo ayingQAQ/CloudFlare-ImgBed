@@ -40,10 +40,10 @@ binding = "IMAGES"
 # database_name = "img_d1"
 # database_id = ""
 
-# [[r2_buckets]]
-# binding = "img_r2"
-# bucket_name = ""
+[[r2_buckets]]
+binding = "img_r2"
+bucket_name = "imgbed-r2"
 
-# [[kv_namespaces]]
-# binding = "img_url"
-# id = ""
+[[kv_namespaces]]
+binding = "img_url"
+id = "5f773d4c02c04820a7b36b8d08fedc21"
