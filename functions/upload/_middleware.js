@@ -2,6 +2,8 @@ import { errorHandling, telemetryData, checkDatabaseConfig } from '../utils/midd
 import { releaseR2, checkR2Reservation } from '../utils/r2Capacity.js';
 import { getDatabase } from '../utils/databaseAdapter.js';
 import { userAuthCheck, UnauthorizedResponse } from '../utils/auth/userAuth.js';
+import { authenticate, AUTH_SCOPE } from '../utils/auth/authCore.js';
+import { applyUploadNamespace, finishAnonymousUpload, reserveAnonymousUpload } from '../utils/anonymousUpload.js';
 import {
     resolveAutomaticPrimary,
     isAutomaticChannelRequest,
@@ -56,7 +58,10 @@ async function storageTiering(context) {
     if (cleanup) {
         const session = JSON.parse(await getDatabase(context.env).get(`upload_session_${originalUrl.searchParams.get('uploadId')}`) || 'null');
         const response = await context.next();
-        if (response.ok) await releaseR2(context.env.img_r2, session?.tieringReservation);
+        if (response.ok) {
+            await releaseR2(context.env.img_r2, session?.tieringReservation);
+            await finishAnonymousUpload(context.env.img_r2, originalRequest, session?.anonymousReservation, false);
+        }
         return response;
     }
 
@@ -69,6 +74,9 @@ async function storageTiering(context) {
     let downstreamUrl = originalUrl;
     const automaticRequest = isAutomaticChannelRequest(originalUrl);
     let reservationId;
+    let anonymousReservation;
+    const admin = await authenticate({ env: context.env, request: originalRequest, url: originalUrl, requiredPermission: 'upload', authScope: AUTH_SCOPE.ADMIN });
+    const isAnonymous = !admin.authorized;
     if (isChunkPart || isMerge) {
         const form = await originalRequest.clone().formData();
         const session = JSON.parse(await getDatabase(context.env).get(`upload_session_${form.get('uploadId')}`) || 'null');
@@ -89,11 +97,33 @@ async function storageTiering(context) {
             downstreamUrl.searchParams.set('tieringReservation', reservationId);
             downstreamRequest = new Request(downstreamUrl, originalRequest);
         }
+        if (session?.anonymousReservation) {
+            anonymousReservation = session.anonymousReservation;
+            downstreamUrl = new URL(downstreamUrl);
+            downstreamUrl.searchParams.set('anonymousReservation', anonymousReservation);
+            downstreamUrl.searchParams.set('uploadFolder', session.uploadFolder || '');
+            downstreamRequest = new Request(downstreamUrl, downstreamRequest);
+        }
+    }
+
+    if (isAnonymous && !isChunkPart && !isMerge && !cleanup) {
+        const quota = await reserveAnonymousUpload(context.env.img_r2, originalRequest);
+        if (!quota.reservationId) {
+            return new Response(JSON.stringify({ success: false, error: 'daily_upload_limit_reached' }), {
+                status: 429,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+        }
+        anonymousReservation = quota.reservationId;
+        downstreamUrl = new URL(downstreamUrl);
+        applyUploadNamespace(downstreamUrl, quota.namespace);
+        downstreamUrl.searchParams.set('anonymousReservation', anonymousReservation);
+        downstreamRequest = new Request(downstreamUrl, downstreamRequest);
     }
 
     // Chunk parts and merge requests must keep the channel chosen by the upload session.
     if (automaticRequest && !isChunkPart && !isMerge) {
-        const decision = await resolveAutomaticPrimary(context, originalRequest);
+        const decision = await resolveAutomaticPrimary(context, downstreamRequest);
         reservationId = decision.reservationId;
 
         if (!decision.channel) {
@@ -105,6 +135,7 @@ async function storageTiering(context) {
                     : '没有可用的主存储渠道，请至少配置 R2 或 Hugging Face。',
                 tiering: decision,
             };
+            await finishAnonymousUpload(context.env.img_r2, originalRequest, anonymousReservation, false);
             return new Response(JSON.stringify(details), {
                 status: 503,
                 headers: {
@@ -118,6 +149,7 @@ async function storageTiering(context) {
         // to Hugging Face. Fail before creating a partial session; the frontend can
         // then use the existing HF direct/LFS flow.
         if (isInitChunked && decision.channel === 'huggingface') {
+            await finishAnonymousUpload(context.env.img_r2, originalRequest, anonymousReservation, false);
             return new Response(JSON.stringify({
                 success: false,
                 error: 'hf_direct_upload_required',
@@ -132,7 +164,7 @@ async function storageTiering(context) {
             });
         }
 
-        downstreamUrl = new URL(originalUrl);
+        downstreamUrl = new URL(downstreamUrl);
         downstreamUrl.searchParams.set('uploadChannel', decision.channel);
         downstreamUrl.searchParams.delete('channelName');
 
@@ -166,11 +198,21 @@ async function storageTiering(context) {
     let response;
     try {
         response = await context.next(downstreamRequest);
+    } catch (error) {
+        await finishAnonymousUpload(context.env.img_r2, originalRequest, anonymousReservation, false);
+        anonymousReservation = undefined;
+        throw error;
     } finally {
         // A successful init keeps capacity until merge; failed parts can be retried.
         if (reservationId && ((!isChunkPart && !isInitChunked) || (isInitChunked && !response?.ok))) {
             await releaseR2(context.env.img_r2, reservationId);
         }
+    }
+
+    if (anonymousReservation && !isChunkPart && !isInitChunked) {
+        await finishAnonymousUpload(context.env.img_r2, originalRequest, anonymousReservation, !!response?.ok);
+    } else if (anonymousReservation && isInitChunked && !response?.ok) {
+        await finishAnonymousUpload(context.env.img_r2, originalRequest, anonymousReservation, false);
     }
 
     const isFinalUpload = !isInitChunked && !isChunkPart;

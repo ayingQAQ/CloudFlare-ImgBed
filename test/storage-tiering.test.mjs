@@ -12,6 +12,7 @@ import { resolveAutomaticPrimary, isAutomaticChannelRequest } from '../functions
 import { enqueueTelegramBackup, processTelegramBackup, getTelegramBackup, readTelegramBackup, relocateTelegramBackup } from '../functions/utils/telegramBackup.js';
 import { onRequest as middleware } from '../functions/upload/_middleware.js';
 import { sanitizeUploadFolder } from '../functions/upload/uploadTools.js';
+import { applyUploadNamespace, finishAnonymousUpload, reserveAnonymousUpload } from '../functions/utils/anonymousUpload.js';
 
 const MB = 1024 * 1024;
 function local(t, baseDirectory = tmpdir()) {
@@ -156,6 +157,27 @@ test('internal namespace cannot be selected as an upload directory', () => {
     for (const path of ['.imgbed-internal', '/.imgbed-internal/a', '%2eimgbed-internal', '\\.imgbed-internal']) {
         assert.throws(() => sanitizeUploadFolder(path), /Reserved/);
     }
+});
+
+test('anonymous quota is isolated per visitor and enforces 30 completed or reserved uploads', async t => {
+    const bucket = local(t);
+    const alice = new Request('https://test/upload', { headers: { 'CF-Connecting-IP': '192.0.2.1' } });
+    const bob = new Request('https://test/upload', { headers: { 'CF-Connecting-IP': '192.0.2.2' } });
+    const reservations = [];
+    for (let index = 0; index < 30; index++) {
+        const result = await reserveAnonymousUpload(bucket, alice);
+        assert(result.reservationId);
+        reservations.push(result.reservationId);
+    }
+    assert.equal((await reserveAnonymousUpload(bucket, alice)).reservationId, null);
+    assert((await reserveAnonymousUpload(bucket, bob)).reservationId);
+    await finishAnonymousUpload(bucket, alice, reservations[0], false);
+    assert((await reserveAnonymousUpload(bucket, alice)).reservationId);
+
+    const url = new URL('https://test/upload?uploadFolder=/album');
+    const identity = await reserveAnonymousUpload(bucket, new Request('https://test/upload', { headers: { 'CF-Connecting-IP': '192.0.2.3' } }));
+    applyUploadNamespace(url, identity.namespace);
+    assert.match(url.searchParams.get('uploadFolder'), /^guest\/[a-f0-9]{24}\/album$/);
 });
 
 function frontendSource() {

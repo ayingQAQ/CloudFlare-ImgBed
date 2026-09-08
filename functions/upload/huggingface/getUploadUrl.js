@@ -13,6 +13,8 @@
 import { HuggingFaceAPI } from '../../utils/storage/huggingfaceAPI.js';
 import { fetchUploadConfig } from '../../utils/sysConfig.js';
 import { userAuthCheck, UnauthorizedResponse } from '../../utils/auth/userAuth.js';
+import { authenticate, AUTH_SCOPE } from '../../utils/auth/authCore.js';
+import { applyUploadNamespace, finishAnonymousUpload, reserveAnonymousUpload } from '../../utils/anonymousUpload.js';
 import { buildUniqueFileId, getUploadIp, isBlockedUploadIp, createResponse } from '../uploadTools.js';
 
 export async function onRequestPost(context) {
@@ -20,6 +22,7 @@ export async function onRequestPost(context) {
     const url = new URL(request.url);
     context.url = url;  // 将 url 添加到 context 以便 buildUniqueFileId 使用
 
+    let anonymousReservation;
     try {
         // 鉴权
         const requiredPermission = 'upload';
@@ -78,11 +81,23 @@ export async function onRequestPost(context) {
             });
         }
 
+        const admin = await authenticate({ env, request, url, requiredPermission: 'upload', authScope: AUTH_SCOPE.ADMIN });
+        if (!admin.authorized) {
+            const quota = await reserveAnonymousUpload(env.img_r2, request);
+            if (!quota.reservationId) {
+                return createResponse(JSON.stringify({ error: 'daily_upload_limit_reached' }), {
+                    status: 429, headers: { 'Content-Type': 'application/json' }
+                });
+            }
+            anonymousReservation = quota.reservationId;
+            applyUploadNamespace(url, quota.namespace, uploadFolder);
+        }
+
         // 将命名参数添加到 URL 以便 buildUniqueFileId 使用
         if (uploadNameType) {
             url.searchParams.set('uploadNameType', uploadNameType);
         }
-        if (uploadFolder) {
+        if (uploadFolder && !anonymousReservation) {
             url.searchParams.set('uploadFolder', uploadFolder);
         }
 
@@ -109,6 +124,7 @@ export async function onRequestPost(context) {
             channelName: hfChannel.name,
             repo: hfChannel.repo,
             isPrivate: hfChannel.isPrivate || false,
+            anonymousReservation,
             ...uploadInfo
         }), {
             status: 200,
@@ -116,6 +132,7 @@ export async function onRequestPost(context) {
         });
 
     } catch (error) {
+        await finishAnonymousUpload(env.img_r2, request, anonymousReservation, false);
         console.error('getUploadUrl error:', error.message);
         return createResponse(JSON.stringify({ error: error.message }), {
             status: 500,

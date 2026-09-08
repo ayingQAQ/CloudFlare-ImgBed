@@ -10,11 +10,15 @@ import { getDatabase } from '../../utils/databaseAdapter.js';
 import { backupFileIdToTelegram } from '../../utils/storageTiering.js';
 import { moderateContent, endUpload, getUploadIp, getIPAddress, sanitizeUploadFolder, createResponse } from '../uploadTools.js';
 import { userAuthCheck, UnauthorizedResponse } from '../../utils/auth/userAuth.js';
+import { authenticate, AUTH_SCOPE } from '../../utils/auth/authCore.js';
+import { finishAnonymousUpload, getAnonymousIdentity } from '../../utils/anonymousUpload.js';
 
 export async function onRequestPost(context) {
     const { request, env, waitUntil } = context;
     const url = new URL(request.url);
 
+    let anonymousReservation;
+    let isAnonymous = false;
     try {
         // 鉴权
         const requiredPermission = 'upload';
@@ -24,6 +28,7 @@ export async function onRequestPost(context) {
 
         const body = await request.json();
         const { fullId, filePath, sha256, fileSize, fileName, fileType, channelName } = body;
+        anonymousReservation = body.anonymousReservation;
 
         if (!fullId || !filePath || !sha256 || !fileSize) {
             return createResponse(JSON.stringify({
@@ -32,6 +37,17 @@ export async function onRequestPost(context) {
                 status: 400,
                 headers: { 'Content-Type': 'application/json' }
             });
+        }
+
+        const admin = await authenticate({ env, request, url, requiredPermission: 'upload', authScope: AUTH_SCOPE.ADMIN });
+        isAnonymous = !admin.authorized;
+        if (isAnonymous) {
+            const identity = await getAnonymousIdentity(request);
+            if (!anonymousReservation || !fullId.startsWith(`${identity.namespace}/`)) {
+                return createResponse(JSON.stringify({ error: 'Invalid anonymous upload reservation' }), {
+                    status: 403, headers: { 'Content-Type': 'application/json' }
+                });
+            }
         }
 
         // 路径安全处理：使用统一的路径安全函数
@@ -136,6 +152,11 @@ export async function onRequestPost(context) {
         };
         waitUntil(endUpload(uploadContext, fullId, metadata));
 
+        if (isAnonymous) {
+            await finishAnonymousUpload(env.img_r2, request, anonymousReservation, true);
+            anonymousReservation = undefined;
+        }
+
         // HF 大文件是浏览器直传，不经过 /upload 的主文件请求。
         // 在提交成功并持久化元数据后，从 HF 分片读取并异步备份到 Telegram。
         await backupFileIdToTelegram(context, fullId, 'huggingface');
@@ -163,6 +184,7 @@ export async function onRequestPost(context) {
         });
 
     } catch (error) {
+        if (isAnonymous) await finishAnonymousUpload(env.img_r2, request, anonymousReservation, false);
         console.error('commitUpload error:', error.message);
         return createResponse(JSON.stringify({ error: error.message }), {
             status: 500,

@@ -87,7 +87,7 @@ async function getPublicFileList(context, url, dir, recursive) {
     }
 
     // 转换文件格式（只保留必要信息）
-    const files = result.files.map(file => ({
+    const files = result.files.filter(file => !file.id.startsWith('guest/')).map(file => ({
         id: file.id,
         metadata: {
             FileType: file.metadata?.FileType,
@@ -98,8 +98,11 @@ async function getPublicFileList(context, url, dir, recursive) {
 
     const cacheData = {
         files,
-        directories: result.directories,
-        totalCount: result.totalCount,
+        directories: result.directories.filter(directory => {
+            const normalized = directory.replace(/^\/+|\/+$/g, '');
+            return normalized !== 'guest' && !normalized.startsWith('guest/');
+        }),
+        totalCount: files.length,
     };
 
     // 缓存结果，缓存时间为24小时

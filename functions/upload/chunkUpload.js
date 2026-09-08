@@ -50,6 +50,8 @@ export async function initializeChunkedUpload(context) {
             uploadChannel,
             channelName,
             tieringReservation: url.searchParams.get('tieringReservation') || undefined,
+            anonymousReservation: url.searchParams.get('anonymousReservation') || undefined,
+            uploadFolder: url.searchParams.get('uploadFolder') || '',
             uploadIp,
             ipAddress,
             status: 'initialized',

@@ -1,6 +1,5 @@
 import { getDirectoryTree } from '../utils/indexManager';
 import { dualAuthCheck } from '../utils/auth/dualAuth';
-import { fetchPageConfig } from '../utils/sysConfig';
 
 /**
  * 目录树 API 端点
@@ -29,17 +28,9 @@ export async function onRequestGet(context) {
     
     // 非管理员身份（用户端或未配置认证的匿名访问），检查 showDirectorySuggestions 设置
     if (authResult.authType !== 'admin') {
-        const pageConfig = await fetchPageConfig(env);
-        // 从 config 数组中查找 showDirectorySuggestions 设置
-        const showDirSetting = pageConfig.config?.find(c => c.id === 'showDirectorySuggestions');
-        const showDirectorySuggestions = showDirSetting?.value ?? showDirSetting?.default ?? true;
-        
-        if (!showDirectorySuggestions) {
-            return new Response(JSON.stringify({ error: 'Directory suggestions disabled' }), {
-                status: 403,
-                headers: { 'Content-Type': 'application/json' }
-            });
-        }
+        return new Response(JSON.stringify({ tree: { name: '', path: '', children: [] } }), {
+            headers: { 'Content-Type': 'application/json', 'Cache-Control': 'private, no-store' }
+        });
     }
     
     try {
