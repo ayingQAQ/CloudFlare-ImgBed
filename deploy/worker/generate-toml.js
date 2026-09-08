@@ -7,6 +7,7 @@
  *   D1_DATABASE_ID   - D1 数据库 ID
  *   KV_NAMESPACE_ID  - KV 命名空间 ID
  *   R2_BUCKET_NAME   - R2 存储桶名称
+ *   CUSTOM_DOMAIN    - Worker 自定义域名（例如 imgb.top）
  *   WORKER_VARS      - JSON 格式的业务环境变量
  */
 
@@ -19,11 +20,13 @@ const outputPath = join(__dirname, 'wrangler.toml');
 
 const env = process.env;
 const name = env.WORKER_NAME || 'cloudflare-imgbed';
+const tomlString = value => String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
 let toml = `name = "${name}"
 main = "index.js"
 compatibility_date = "2024-08-21"
 compatibility_flags = ["global_fetch_strictly_public"]
+${env.CUSTOM_DOMAIN ? `routes = [{ pattern = "${tomlString(env.CUSTOM_DOMAIN)}", custom_domain = true }]\n` : ''}
 
 [triggers]
 crons = ["* * * * *"]
@@ -73,7 +76,7 @@ if (env.WORKER_VARS) {
         if (entries.length > 0) {
             toml += '\n[vars]\n';
             for (const [key, value] of entries) {
-                toml += `${key} = "${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"\n`;
+                toml += `${key} = "${tomlString(value)}"\n`;
             }
         }
     } catch (e) {
