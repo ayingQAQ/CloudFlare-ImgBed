@@ -8,6 +8,8 @@ const PENDING = `${INTERNAL_PREFIX}telegram/pending/`;
 const COMPLETE = `${INTERNAL_PREFIX}telegram/complete/`;
 const CURSOR = `${INTERNAL_PREFIX}telegram/cursor.json`;
 const CHUNK_SIZE = 8 * 1024 * 1024;
+const TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
+const PREVIEW_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const json = object => new Response(object.body).json();
 const encodePath = path => path.split('/').map(encodeURIComponent).join('/');
 const sourceMetadata = metadata => Object.fromEntries([
@@ -113,6 +115,40 @@ async function readSlice(env, job, config, start, end) {
     return new Blob(chunks);
 }
 
+function previewImageType(job) {
+    return String(job.metadata?.FileType || '').split(';')[0].trim().toLowerCase();
+}
+
+function shouldSendPreview(job) {
+    return PREVIEW_IMAGE_TYPES.has(previewImageType(job)) && job.size > 0 &&
+        job.size <= TG_PHOTO_MAX_BYTES && !job.preview;
+}
+
+async function sendTelegramPreview(env, job, config, channel) {
+    const source = await readSlice(env, job, config, 0, job.size);
+    const photo = new Blob([source], { type: previewImageType(job) || 'image/jpeg' });
+    const form = new FormData();
+    form.set('chat_id', channel.chatId);
+    form.set('photo', photo, job.metadata.FileName || 'preview.jpg');
+    form.set('caption', [
+        `🖼 ${job.metadata.FileName || 'Image'}`,
+        `Size: ${(job.size / 1024 / 1024).toFixed(2)} MB`,
+        `Primary: ${job.primaryChannel === 'cfr2' ? 'R2' : 'Hugging Face'}`,
+        `Backup ID: ${job.id.slice(0, 12)}`,
+    ].join('\n'));
+    const api = new TelegramAPI(channel.botToken, channel.proxyUrl || '');
+    const response = await fetch(`${api.baseURL}/sendPhoto`, {
+        method: 'POST', body: form, signal: AbortSignal.timeout(15000),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok || !result.result?.message_id) {
+        throw new Error(`Telegram preview failed: ${response.status}, code ${result.error_code || 'unknown'}`);
+    }
+    const photos = result.result.photo || [];
+    return { status: 'ready', messageId: result.result.message_id,
+        fileId: photos.at(-1)?.file_id || null, createdAt: Date.now() };
+}
+
 export async function processTelegramBackup(env, id) {
     const bucket = env.img_r2;
     const key = PENDING + id;
@@ -143,6 +179,17 @@ export async function processTelegramBackup(env, id) {
             if (!channel?.botToken || !channel.chatId) throw new Error('Telegram backup channel is not configured');
             const botId = channel.botToken.split(':')[0];
             if (job.botId && job.botId !== botId) throw new Error('Telegram backup bot changed');
+            // A photo is only a human-friendly preview. The document chunks remain the recoverable copy.
+            if (shouldSendPreview(job)) {
+                try {
+                    job.preview = await sendTelegramPreview(env, job, config, channel);
+                } catch (error) {
+                    console.warn('Telegram image preview failed:', error.message);
+                    job.preview = { status: 'failed', error: String(error.message).slice(0, 200), updatedAt: Date.now() };
+                }
+            } else if (!job.preview && previewImageType(job).startsWith('image/') && job.size > TG_PHOTO_MAX_BYTES) {
+                job.preview = { status: 'skipped', reason: 'photo_too_large', updatedAt: Date.now() };
+            }
             const index = job.chunks.length;
             const start = index * CHUNK_SIZE;
             const end = Math.min(start + CHUNK_SIZE, job.size);

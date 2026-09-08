@@ -159,6 +159,29 @@ test('internal namespace cannot be selected as an upload directory', () => {
     }
 });
 
+test('image preview failure does not block the recoverable Telegram document backup', async t => {
+    const bucket = local(t); const { env, records } = environment(bucket);
+    await bucket.put('image.png', 'not-a-real-png');
+    records.set('image.png', { value: '', metadata: { FileName: 'image.png', FileType: 'image/png',
+        Channel: 'CloudflareR2', ChannelName: 'R2_env', TimeStamp: 11, FileSizeBytes: 14 } });
+    const originalFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = originalFetch; });
+    const calls = [];
+    globalThis.fetch = async url => {
+        calls.push(String(url).split('/').pop());
+        if (String(url).endsWith('/sendPhoto')) return Response.json({ ok: false, error_code: 400 }, { status: 400 });
+        return Response.json({ ok: true, result: { document: { file_id: 'original' } } });
+    };
+    const work = [];
+    await enqueueTelegramBackup({ env, waitUntil: promise => work.push(promise) }, 'image.png', 'cfr2');
+    await Promise.all(work);
+    const job = await getTelegramBackup(env, 'image.png');
+    assert.deepEqual(calls, ['sendPhoto', 'sendDocument']);
+    assert.equal(job.preview.status, 'failed');
+    assert.equal(job.status, 'ready');
+    assert.equal(job.chunks[0].fileId, 'original');
+});
+
 test('anonymous quota is isolated per visitor and enforces 30 completed or reserved uploads', async t => {
     const bucket = local(t);
     const alice = new Request('https://test/upload', { headers: { 'CF-Connecting-IP': '192.0.2.1' } });
