@@ -1,7 +1,7 @@
-import { getDatabase } from '../utils/databaseAdapter.js';
 import { readIndex } from '../utils/indexManager.js';
+import { getSiteStats, recordVisit } from '../utils/siteStats.js';
+import { getDatabase } from '../utils/databaseAdapter.js';
 
-const VISIT_COUNT_KEY = 'manage@siteStats@visits';
 const VISIT_COOKIE = 'imgbed_visit';
 
 function hasVisitCookie(request) {
@@ -9,14 +9,9 @@ function hasVisitCookie(request) {
     return cookies.split(';').some(part => part.trim().startsWith(`${VISIT_COOKIE}=`));
 }
 
-async function getImageCount(context) {
+async function getInitialImageCount(context) {
     const result = await readIndex(context, { fileType: 'image', countOnly: true });
     return Number(result.totalCount) || 0;
-}
-
-async function getVisitCount(env) {
-    const value = await getDatabase(env).get(VISIT_COUNT_KEY);
-    return Number.parseInt(value || '0', 10) || 0;
 }
 
 function json(data, headers = {}) {
@@ -29,27 +24,27 @@ function json(data, headers = {}) {
     });
 }
 
-export async function onRequestGet(context) {
-    const [visits, images] = await Promise.all([
-        getVisitCount(context.env),
-        getImageCount(context)
+async function loadStats(context) {
+    const current = await getSiteStats(context.env.img_r2);
+    if (current.initialized) return current;
+    const [images, legacyVisits] = await Promise.all([
+        getInitialImageCount(context),
+        getDatabase(context.env).get('manage@siteStats@visits'),
     ]);
-    return json({ visits, images });
+    return getSiteStats(context.env.img_r2, images, legacyVisits);
+}
+
+export async function onRequestGet(context) {
+    const stats = await loadStats(context);
+    return json(stats);
 }
 
 export async function onRequestPost(context) {
     const alreadyCounted = hasVisitCookie(context.request);
-    const db = getDatabase(context.env);
-    let visits = await getVisitCount(context.env);
-
-    if (!alreadyCounted) {
-        visits += 1;
-        await db.put(VISIT_COUNT_KEY, String(visits));
-    }
-
-    const images = await getImageCount(context);
+    const current = await loadStats(context);
+    const stats = alreadyCounted ? current : await recordVisit(context.env.img_r2);
     const headers = alreadyCounted ? {} : {
         'Set-Cookie': `${VISIT_COOKIE}=1; Path=/; Max-Age=86400; SameSite=Lax; Secure`
     };
-    return json({ visits, images }, headers);
+    return json(stats, headers);
 }

@@ -12,6 +12,7 @@ import { moderateContent, endUpload, getUploadIp, getIPAddress, sanitizeUploadFo
 import { userAuthCheck, UnauthorizedResponse } from '../../utils/auth/userAuth.js';
 import { authenticate, AUTH_SCOPE } from '../../utils/auth/authCore.js';
 import { finishAnonymousUpload, getAnonymousIdentity } from '../../utils/anonymousUpload.js';
+import { recordImageUpload } from '../../utils/siteStats.js';
 
 export async function onRequestPost(context) {
     const { request, env, waitUntil } = context;
@@ -151,6 +152,7 @@ export async function onRequestPost(context) {
             url
         };
         waitUntil(endUpload(uploadContext, fullId, metadata));
+        waitUntil(recordImageUpload(env.img_r2, metadata));
 
         if (isAnonymous) {
             await finishAnonymousUpload(env.img_r2, request, anonymousReservation, true);

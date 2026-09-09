@@ -12,11 +12,12 @@ import {
     extractUploadedFileId,
     backupFileIdToTelegram,
 } from '../utils/storageTiering.js';
+import { recordImageUpload } from '../utils/siteStats.js';
 
 const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Visitor-ID',
     'Access-Control-Max-Age': '86400',
 };
 
@@ -216,12 +217,20 @@ async function storageTiering(context) {
     }
 
     const isFinalUpload = !isInitChunked && !isChunkPart;
+    let uploadedFileId;
+    if (isFinalUpload && response.ok) {
+        uploadedFileId = await extractUploadedFileId(response.clone());
+        if (uploadedFileId) {
+            const record = await getDatabase(context.env).getWithMetadata(uploadedFileId);
+            context.waitUntil(recordImageUpload(context.env.img_r2, record?.metadata));
+        }
+    }
     if (
         isFinalUpload &&
         response.ok &&
         shouldScheduleTelegramBackup(effectivePrimary, downstreamUrl)
     ) {
-        const fileId = await extractUploadedFileId(response.clone());
+        const fileId = uploadedFileId || await extractUploadedFileId(response.clone());
         if (fileId) {
             // Persist the job before acknowledging success. Processing is resumable.
             await backupFileIdToTelegram(context, fileId, effectivePrimary);

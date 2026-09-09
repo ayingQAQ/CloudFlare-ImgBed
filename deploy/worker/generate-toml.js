@@ -22,6 +22,13 @@ const env = process.env;
 const name = env.WORKER_NAME || 'cloudflare-imgbed';
 const tomlString = value => String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
+if (!env.D1_DATABASE_ID && !env.KV_NAMESPACE_ID) {
+    throw new Error('Missing database binding: configure D1_DATABASE_ID or KV_NAMESPACE_ID');
+}
+if (!env.R2_BUCKET_NAME) {
+    throw new Error('Missing R2_BUCKET_NAME: anonymous quota and durable Telegram backup require R2');
+}
+
 let toml = `name = "${name}"
 main = "index.js"
 compatibility_date = "2024-08-21"
