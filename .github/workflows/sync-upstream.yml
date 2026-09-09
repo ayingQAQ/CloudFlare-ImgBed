@@ -6,8 +6,9 @@ permissions:
   issues: write
 
 on:
-  schedule:
-    - cron: "0 0 * * *" # every day
+  # This fork carries storage, authentication and compiled frontend changes.
+  # Upstream updates must be reviewed manually because direct merges can conflict
+  # with production assets and trigger an unsafe deployment.
   workflow_dispatch:
     inputs:
       confirm_breaking_update:
