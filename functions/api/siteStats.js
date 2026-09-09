@@ -36,7 +36,7 @@ async function loadStats(context) {
 
 export async function onRequestGet(context) {
     const stats = await loadStats(context);
-    return json(stats);
+    return json({ visits: stats.visits, images: stats.images });
 }
 
 export async function onRequestPost(context) {
@@ -46,5 +46,5 @@ export async function onRequestPost(context) {
     const headers = alreadyCounted ? {} : {
         'Set-Cookie': `${VISIT_COOKIE}=1; Path=/; Max-Age=86400; SameSite=Lax; Secure`
     };
-    return json(stats, headers);
+    return json({ visits: stats.visits, images: stats.images }, headers);
 }
