@@ -389,7 +389,12 @@ async function maybeServeFromCache(request, ctx, producer) {
 
 export default {
     async scheduled(event, env, ctx) {
-        ctx.waitUntil(drainTelegramBackups(env));
+        ctx.waitUntil(drainTelegramBackups(env).catch(error => {
+            // R2 and Telegram failures are retried by the next cron run. Keep a
+            // transient background failure from failing the whole Worker event.
+            console.error('Scheduled Telegram backup drain failed:', error?.message || error);
+            return 0;
+        }));
     },
     async fetch(request, env, ctx) {
         const url = new URL(request.url);

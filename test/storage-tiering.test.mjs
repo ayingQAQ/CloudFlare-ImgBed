@@ -13,8 +13,26 @@ import { enqueueTelegramBackup, processTelegramBackup, getTelegramBackup, readTe
 import { onRequest as middleware } from '../functions/upload/_middleware.js';
 import { sanitizeUploadFolder } from '../functions/upload/uploadTools.js';
 import { applyUploadNamespace, finishAnonymousUpload, reserveAnonymousUpload } from '../functions/utils/anonymousUpload.js';
+import worker from '../deploy/worker/index.js';
 
 const MB = 1024 * 1024;
+
+test('scheduled backup drain contains transient storage failures', async () => {
+    const pending = [];
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+        worker.scheduled({}, {
+            img_r2: { get: async () => { throw new Error('temporary R2 failure'); } },
+        }, {
+            waitUntil(promise) { pending.push(promise); },
+        });
+        assert.equal(pending.length, 1);
+        await assert.doesNotReject(Promise.all(pending));
+    } finally {
+        console.error = originalError;
+    }
+});
 function local(t, baseDirectory = tmpdir()) {
     const path = mkdtempSync(join(baseDirectory, '.imgbed-tiering-'));
     t.after(() => {
