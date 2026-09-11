@@ -9,7 +9,10 @@ const COMPLETE = `${INTERNAL_PREFIX}telegram/complete/`;
 const CURSOR = `${INTERNAL_PREFIX}telegram/cursor.json`;
 const CHUNK_SIZE = 8 * 1024 * 1024;
 const TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
+const TG_VIDEO_MAX_BYTES = 50 * 1024 * 1024;
+const CF_REMOTE_IMAGE_MAX_BYTES = 100 * 1000 * 1000;
 const PREVIEW_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const PREVIEW_VIDEO_TYPES = new Set(['video/mp4']);
 const json = object => new Response(object.body).json();
 const encodePath = path => path.split('/').map(encodeURIComponent).join('/');
 const sourceMetadata = metadata => Object.fromEntries([
@@ -64,7 +67,8 @@ export async function enqueueTelegramBackup(context, fileId, primaryChannel) {
     const sourceHead = primaryChannel === 'cfr2' ? await bucket.head(fileId) : null;
     const size = sourceHead?.size ?? Number(metadata.FileSizeBytes);
     if (!Number.isSafeInteger(size) || size < 0) throw new Error('Backup source size is unavailable');
-    const job = { id, fileId, primaryChannel, metadata: sourceMetadata(metadata), size, sourceEtag: sourceHead?.etag,
+    const origin = context.request ? new URL(context.request.url).origin : '';
+    const job = { id, fileId, primaryChannel, metadata: sourceMetadata(metadata), size, sourceEtag: sourceHead?.etag, origin,
         chunks: [], status: 'pending', attempts: 0, nextAttemptAt: 0, createdAt: Date.now() };
     // No writes to the file's KV key: manifests live in R2 values, without the 1KB limit.
     await r2Put(bucket, PENDING + id, JSON.stringify(job), { onlyIf: { etagDoesNotMatch: '*' } });
@@ -120,25 +124,63 @@ function previewImageType(job) {
 }
 
 function shouldSendPreview(job) {
-    return PREVIEW_IMAGE_TYPES.has(previewImageType(job)) && job.size > 0 &&
-        job.size <= TG_PHOTO_MAX_BYTES && !job.preview;
+    const type = previewImageType(job);
+    return job.size > 0 && !job.preview && (
+        PREVIEW_IMAGE_TYPES.has(type) && job.size <= CF_REMOTE_IMAGE_MAX_BYTES ||
+        PREVIEW_VIDEO_TYPES.has(type) && job.size <= TG_VIDEO_MAX_BYTES
+    );
+}
+
+async function createTelegramPreview(env, job, config) {
+    if (job.size <= TG_PHOTO_MAX_BYTES) {
+        return { blob: await readSlice(env, job, config, 0, job.size), type: previewImageType(job), suffix: '' };
+    }
+    if (!job.origin) throw new Error('Large image preview source URL is unavailable');
+    const sourceUrl = `${job.origin}/file/${encodePath(job.fileId)}?telegram-preview=${encodeURIComponent(job.id)}`;
+    const response = await fetch(sourceUrl, {
+        cf: { image: { width: 1920, height: 1920, fit: 'scale-down', quality: 76, format: 'jpeg' } },
+        signal: AbortSignal.timeout(30000),
+    });
+    if (!response.ok || !response.body) {
+        await response.body?.cancel();
+        throw new Error(`Cloudflare preview transform failed: ${response.status}`);
+    }
+    const declaredSize = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredSize) && declaredSize > TG_PHOTO_MAX_BYTES) {
+        await response.body.cancel();
+        throw new Error('Cloudflare preview transform is still larger than 10 MB');
+    }
+    const blob = await response.blob();
+    if (blob.size > TG_PHOTO_MAX_BYTES) throw new Error('Cloudflare preview transform is still larger than 10 MB');
+    return { blob, type: 'image/jpeg', suffix: '.preview.jpg' };
 }
 
 async function sendTelegramPreview(env, job, config, channel) {
-    const source = await readSlice(env, job, config, 0, job.size);
-    const photo = new Blob([source], { type: previewImageType(job) || 'image/jpeg' });
     const form = new FormData();
     form.set('chat_id', channel.chatId);
-    form.set('photo', photo, job.metadata.FileName || 'preview.jpg');
+    const type = previewImageType(job);
+    const isVideo = PREVIEW_VIDEO_TYPES.has(type);
+    let method;
+    if (isVideo) {
+        const video = await readSlice(env, job, config, 0, job.size);
+        form.set('video', new Blob([video], { type }), job.metadata.FileName || 'video.mp4');
+        form.set('supports_streaming', 'true');
+        method = 'sendVideo';
+    } else {
+        const preview = await createTelegramPreview(env, job, config);
+        form.set('photo', new Blob([preview.blob], { type: preview.type || 'image/jpeg' }),
+            `${job.metadata.FileName || 'preview'}${preview.suffix}`);
+        method = 'sendPhoto';
+    }
     form.set('caption', [
-        `🖼 ${job.metadata.FileName || 'Image'}`,
+        `${isVideo ? '🎬' : '🖼'} ${job.metadata.FileName || (isVideo ? 'Video' : 'Image')}`,
         `Size: ${(job.size / 1024 / 1024).toFixed(2)} MB`,
         `Primary: ${job.primaryChannel === 'cfr2' ? 'R2' : 'Hugging Face'}`,
         `Backup ID: ${job.id.slice(0, 12)}`,
     ].join('\n'));
     const api = new TelegramAPI(channel.botToken, channel.proxyUrl || '');
-    const response = await fetch(`${api.baseURL}/sendPhoto`, {
-        method: 'POST', body: form, signal: AbortSignal.timeout(15000),
+    const response = await fetch(`${api.baseURL}/${method}`, {
+        method: 'POST', body: form, signal: AbortSignal.timeout(isVideo ? 60000 : 15000),
     });
     const result = await response.json();
     if (!response.ok || !result.ok || !result.result?.message_id) {
@@ -146,7 +188,8 @@ async function sendTelegramPreview(env, job, config, channel) {
     }
     const photos = result.result.photo || [];
     return { status: 'ready', messageId: result.result.message_id,
-        fileId: photos.at(-1)?.file_id || null, createdAt: Date.now() };
+        fileId: isVideo ? result.result.video?.file_id || null : photos.at(-1)?.file_id || null,
+        kind: isVideo ? 'video' : 'photo', createdAt: Date.now() };
 }
 
 export async function processTelegramBackup(env, id) {
@@ -184,11 +227,13 @@ export async function processTelegramBackup(env, id) {
                 try {
                     job.preview = await sendTelegramPreview(env, job, config, channel);
                 } catch (error) {
-                    console.warn('Telegram image preview failed:', error.message);
+                    console.warn('Telegram media preview failed:', error.message);
                     job.preview = { status: 'failed', error: String(error.message).slice(0, 200), updatedAt: Date.now() };
                 }
-            } else if (!job.preview && previewImageType(job).startsWith('image/') && job.size > TG_PHOTO_MAX_BYTES) {
-                job.preview = { status: 'skipped', reason: 'photo_too_large', updatedAt: Date.now() };
+            } else if (!job.preview && previewImageType(job).startsWith('image/') && job.size > CF_REMOTE_IMAGE_MAX_BYTES) {
+                job.preview = { status: 'skipped', reason: 'image_too_large_to_transform', updatedAt: Date.now() };
+            } else if (!job.preview && PREVIEW_VIDEO_TYPES.has(previewImageType(job)) && job.size > TG_VIDEO_MAX_BYTES) {
+                job.preview = { status: 'skipped', reason: 'video_too_large', updatedAt: Date.now() };
             }
             const index = job.chunks.length;
             const start = index * CHUNK_SIZE;

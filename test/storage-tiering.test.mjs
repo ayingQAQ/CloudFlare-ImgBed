@@ -200,6 +200,70 @@ test('image preview failure does not block the recoverable Telegram document bac
     assert.equal(job.chunks[0].fileId, 'original');
 });
 
+test('large images use a transformed Telegram photo preview and keep chunked backup', async t => {
+    const bucket = local(t); const { env, records } = environment(bucket);
+    const size = 21 * MB;
+    await bucket.put('large-image.png', new Uint8Array(size));
+    records.set('large-image.png', { value: '', metadata: { FileName: 'large-image.png', FileType: 'image/png',
+        Channel: 'CloudflareR2', ChannelName: 'R2_env', TimeStamp: 12, FileSizeBytes: size } });
+    const originalFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = originalFetch; });
+    let transformed = false;
+    globalThis.fetch = async (url, options = {}) => {
+        if (String(url).startsWith('https://imgb.top/file/')) {
+            transformed = true;
+            assert.equal(options.cf.image.format, 'jpeg');
+            assert.equal(options.cf.image.fit, 'scale-down');
+            return new Response(new Uint8Array(1024), { headers: { 'content-length': '1024', 'content-type': 'image/jpeg' } });
+        }
+        if (String(url).endsWith('/sendPhoto')) {
+            assert.equal(options.body.get('photo').size, 1024);
+            return Response.json({ ok: true, result: { message_id: 10, photo: [{ file_id: 'preview' }] } });
+        }
+        return Response.json({ ok: true, result: { document: { file_id: 'backup-part' } } });
+    };
+    const work = [];
+    await enqueueTelegramBackup({ env, request: new Request('https://imgb.top/upload'),
+        waitUntil: promise => work.push(promise) }, 'large-image.png', 'cfr2');
+    await Promise.all(work);
+    const job = await getTelegramBackup(env, 'large-image.png');
+    assert.equal(transformed, true);
+    assert.equal(job.preview.status, 'ready');
+    assert.equal(job.preview.fileId, 'preview');
+    assert.equal(job.chunks[0].fileId, 'backup-part');
+});
+
+test('MP4 up to 50 MB is sent as a playable Telegram video and keeps chunked backup', async t => {
+    const bucket = local(t); const { env, records } = environment(bucket);
+    const size = 20 * MB;
+    await bucket.put('video.mp4', new Uint8Array(size));
+    records.set('video.mp4', { value: '', metadata: { FileName: 'video.mp4', FileType: 'video/mp4',
+        Channel: 'CloudflareR2', ChannelName: 'R2_env', TimeStamp: 13, FileSizeBytes: size } });
+    const originalFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = originalFetch; });
+    const calls = [];
+    globalThis.fetch = async (url, options = {}) => {
+        calls.push(String(url).split('/').pop());
+        if (String(url).endsWith('/sendVideo')) {
+            assert.equal(options.body.get('video').size, size);
+            assert.equal(options.body.get('video').type, 'video/mp4');
+            assert.equal(options.body.get('supports_streaming'), 'true');
+            return Response.json({ ok: true, result: { message_id: 11, video: { file_id: 'playable-video' } } });
+        }
+        return Response.json({ ok: true, result: { document: { file_id: 'backup-part' } } });
+    };
+    const work = [];
+    await enqueueTelegramBackup({ env, request: new Request('https://imgb.top/upload'),
+        waitUntil: promise => work.push(promise) }, 'video.mp4', 'cfr2');
+    await Promise.all(work);
+    const job = await getTelegramBackup(env, 'video.mp4');
+    assert.deepEqual(calls, ['sendVideo', 'sendDocument']);
+    assert.equal(job.preview.status, 'ready');
+    assert.equal(job.preview.kind, 'video');
+    assert.equal(job.preview.fileId, 'playable-video');
+    assert.equal(job.chunks[0].fileId, 'backup-part');
+});
+
 test('anonymous quota is isolated per visitor and enforces 30 completed or reserved uploads', async t => {
     const bucket = local(t);
     const alice = new Request('https://test/upload', { headers: { 'CF-Connecting-IP': '192.0.2.1' } });
