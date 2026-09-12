@@ -24,6 +24,23 @@ const IMAGE_TYPES_BY_EXTENSION = new Map([
 ]);
 
 export function parseImageTransform(url, accessConfig = {}) {
+    const displayPreset = url.searchParams.get('from') === 'admin'
+        ? url.searchParams.get('display')
+        : null;
+    if (displayPreset === 'grid') {
+        const dimension = 800;
+        return {
+            requested: true,
+            internalDisplayPreset: true,
+            fallback: 'original',
+            options: {
+                width: dimension,
+                height: dimension,
+                fit: 'cover',
+            },
+        };
+    }
+
     const widthResult = parseDimension(url.searchParams, 'width');
     const heightResult = parseDimension(url.searchParams, 'height');
     const fitResult = parseFit(url.searchParams);
@@ -131,7 +148,7 @@ export function validateImageTransformSource(imageTransform, env, fileType, file
 
 export async function transformImageRequestViaUrl(context) {
     const { env, imageTransform, request } = context;
-    if (!imageTransform?.requested || hasConfiguredImageProcessor(env)) {
+    if (!imageTransform?.requested) {
         return null;
     }
 
@@ -141,11 +158,26 @@ export async function transformImageRequestViaUrl(context) {
         return null;
     }
 
+    if (imageTransform.internalDisplayPreset && env?.IMAGES) {
+        const sourceUrl = new URL(request.url);
+        sourceUrl.searchParams.delete('display');
+        const headers = new Headers(request.headers);
+        headers.delete('Range');
+        return fetch(sourceUrl, {
+            headers,
+            cf: { image: imageTransform.options },
+            signal: AbortSignal.timeout(30000),
+        });
+    }
+
+    if (hasConfiguredImageProcessor(env)) return null;
+
     const sourceUrl = new URL(request.url);
     sourceUrl.searchParams.delete('width');
     sourceUrl.searchParams.delete('height');
     sourceUrl.searchParams.delete('fit');
     sourceUrl.searchParams.delete('fallback');
+    sourceUrl.searchParams.delete('display');
 
     const transformOptions = Object.entries({
         ...imageTransform.options,
