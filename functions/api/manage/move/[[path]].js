@@ -11,9 +11,11 @@ import {
     resolveWebDAVCredentials,
 } from "../../../utils/metadata/channelCredentials.js";
 import { cleanPersistedMetadata } from "../../../utils/metadata/metadataSecurity.js";
+import { relocatePublicFile } from '../../../utils/publicFileId.js';
+import { mapConcurrent } from '../../../utils/concurrent.js';
 
 export async function onRequest(context) {
-    const { request, env, params, waitUntil } = context;
+    const { request, env, params } = context;
 
     const url = new URL(request.url);
 
@@ -51,18 +53,17 @@ export async function onRequest(context) {
                 const folderDist = currentFolder.dist === '' ? curFolderName : `${currentFolder.dist}/${curFolderName}`;
 
                 // 处理当前文件夹下的所有文件
-                for (const file of files) {
+                const moveResults = await mapConcurrent(files, 4, async file => {
                     const fileId = file.name;
                     const fileName = file.name.split('/').pop();
                     const newFileId = `${folderDist}/${fileName}`;
                     const cdnUrl = `https://${url.hostname}/file/${fileId}`;
-
                     const success = await moveFile(env, fileId, newFileId, cdnUrl, url);
-                    if (success) {
-                        processedFiles.push({ fileId: fileId, newFileId: newFileId });
-                    } else {
-                        failedFiles.push(fileId);
-                    }
+                    return { success, fileId, newFileId };
+                });
+                for (const result of moveResults) {
+                    if (result.success) processedFiles.push({ fileId: result.fileId, newFileId: result.newFileId });
+                    else failedFiles.push(result.fileId);
                 }
 
                 // 将子文件夹添加到队列
@@ -83,20 +84,23 @@ export async function onRequest(context) {
 
             // 批量从索引中删除文件，添加新文件
             if (processedFiles.length > 0) {
-                waitUntil(batchMoveFilesInIndex(context, processedFiles.map(file => {
+                await batchMoveFilesInIndex(context, processedFiles.map(file => {
                     return {
                         originalFileId: file.fileId,
                         newFileId: file.newFileId,
                     };
-                })));
+                }));
             }
 
             // 返回处理结果
             return new Response(JSON.stringify({
-                success: true,
+                success: failedFiles.length === 0,
                 processed: processedFiles,
                 failed: failedFiles
-            }));
+            }), {
+                status: failedFiles.length > 0 ? 409 : 200,
+                headers: { 'Content-Type': 'application/json' },
+            });
 
         } catch (e) {
             return new Response(JSON.stringify({
@@ -120,7 +124,7 @@ export async function onRequest(context) {
             throw new Error('Move file failed');
         } else {
             // 从索引中删除旧文件，并添加新文件
-            waitUntil(moveFileInIndex(context, fileId, newFileId));
+            await moveFileInIndex(context, fileId, newFileId);
         }
 
         return new Response(JSON.stringify({
@@ -192,6 +196,7 @@ async function moveFile(env, fileId, newFileId, cdnUrl, url) {
         // 更新KV存储
         await db.put(newFileId, img.value, { metadata: img.metadata });
         await relocateTelegramBackup(env, newFileId, img.metadata);
+        await relocatePublicFile(env, fileId, newFileId);
         await db.delete(fileId);
 
         // 清除CDN缓存

@@ -17,6 +17,17 @@ export async function registerPublicFile(env, id) {
     return alias;
 }
 
+export async function relocatePublicFile(env, oldId, newId) {
+    const db = getDatabase(env);
+    const oldAlias = await publicFileId(oldId);
+    const newAlias = await publicFileId(newId);
+    await Promise.all([
+        db.put(PREFIX + oldAlias, newId),
+        db.put(PREFIX + newAlias, newId),
+    ]);
+    return newAlias;
+}
+
 export async function resolvePublicFile(env, alias, loadFiles) {
     if (!isPublicFileId(alias)) return alias;
     const db = getDatabase(env);

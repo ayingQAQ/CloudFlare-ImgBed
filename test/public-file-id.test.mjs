@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { publicFileId, resolvePublicFile } from '../functions/utils/publicFileId.js';
+import { publicFileId, relocatePublicFile, resolvePublicFile } from '../functions/utils/publicFileId.js';
 
 test('opaque links hide directories, preserve extension and distinguish same filenames', async () => {
     const alias = await publicFileId('照片/旅行/0013.jpg');
@@ -18,4 +18,14 @@ test('old files resolve without redirects; subsequent lookups use their saved ma
     assert.equal(await resolvePublicFile(env, alias, async () => [{ id }]), id);
     assert.equal(await resolvePublicFile(env, alias, () => { throw Error('cached'); }), id);
     assert.equal(await resolvePublicFile(env, await publicFileId('missing'), async () => []), null);
+});
+
+test('moving a file keeps its old link and registers its new link', async () => {
+    const records = new Map();
+    const env = { img_url: { get: async k => records.get(k), put: async (k, v) => records.set(k, v) } };
+    const oldId = 'source/0013.jpg';
+    const newId = 'target/source/0013.jpg';
+    await relocatePublicFile(env, oldId, newId);
+    assert.equal(await resolvePublicFile(env, await publicFileId(oldId), async () => []), newId);
+    assert.equal(await resolvePublicFile(env, await publicFileId(newId), async () => []), newId);
 });
