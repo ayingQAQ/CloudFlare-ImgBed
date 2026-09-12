@@ -1,3 +1,4 @@
+import { savedDirectories } from './directories.js';
 /* 索引管理器 */
 
 /**
@@ -2191,6 +2192,11 @@ export async function getDirectoryTree(context) {
                 }
             }
         }
+    }
+
+    for (const path of await savedDirectories(context.env)) {
+        const parts = path.split('/');
+        for (let i = 1; i <= parts.length; i++) directorySet.add(parts.slice(0, i).join('/') + '/');
     }
 
     // 4. 构建树形结构

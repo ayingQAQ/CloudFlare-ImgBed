@@ -1,3 +1,4 @@
+import { mergeDirectories } from '../../utils/directories.js';
 import {
     readIndex, mergeOperationsToIndex, deleteAllOperations, rebuildIndex,
     getIndexInfo, getIndexStorageStats
@@ -158,7 +159,7 @@ export async function onRequest(context) {
 
         // 索引读取失败，直接从 KV 中获取所有文件记录
         if (!result.success) {
-            const dbRecords = await getAllFileRecords(context.env, dir);
+            const dbRecords = await mergeDirectories(context.env, await getAllFileRecords(context.env, dir), dir);
 
             return new Response(JSON.stringify({
                 files: dbRecords.files,
@@ -174,6 +175,7 @@ export async function onRequest(context) {
             });
         }
 
+        await mergeDirectories(context.env, result, dir);
         const db = getDatabase(context.env);
         const metadataViewContext = await createMetadataViewContext(db, context.env);
 

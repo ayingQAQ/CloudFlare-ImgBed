@@ -1,3 +1,4 @@
+import { changeDirectories } from '../../../utils/directories.js';
 import { S3Client, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { purgeCFCache, purgeRandomFileListCache, purgePublicFileListCache } from "../../../utils/purgeCache";
 import { removeFileFromIndex, batchRemoveFilesFromIndex } from "../../../utils/indexManager.js";
@@ -72,6 +73,8 @@ export async function onRequest(context) {
                     });
                 }
             }
+
+            if (failedFiles.length === 0) await changeDirectories(env, params.path.split(',').join('/'));
 
             // 批量从索引中删除文件
             if (deletedFiles.length > 0) {

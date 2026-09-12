@@ -1,3 +1,4 @@
+import { changeDirectories } from '../../../utils/directories.js';
 import { S3Client, CopyObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { relocateTelegramBackup } from '../../../utils/telegramBackup.js';
 import { purgeCFCache, purgeRandomFileListCache, purgePublicFileListCache } from "../../../utils/purgeCache";
@@ -72,6 +73,12 @@ export async function onRequest(context) {
                         dist: folderDist
                     });
                 }
+            }
+
+            if (failedFiles.length === 0) {
+                const source = params.path.split(',').join('/').replace(/\/+$/, '');
+                const target = [dist, source.split('/').pop()].filter(Boolean).join('/');
+                if (source !== target) await changeDirectories(env, source, target);
             }
 
             // 批量从索引中删除文件，添加新文件
