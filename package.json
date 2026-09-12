@@ -13,7 +13,7 @@
     "start": "npx wrangler pages dev ./frontend-dist --kv \"img_url\" --r2 \"img_r2\" --ip 0.0.0.0 --port 8080 --persist-to ./data",
     "start:docker": "node --import ./deploy/server/register.mjs deploy/server/index.js",
     "deploy:worker": "node deploy/worker/generate-routes.js && npx wrangler deploy --config deploy/worker/wrangler.toml",
-    "test:storage": "node --import ./deploy/server/register.mjs --test test/storage-tiering.test.mjs test/admin-image-preview.test.mjs test/directories.test.mjs"
+    "test:storage": "node --import ./deploy/server/register.mjs --test test/storage-tiering.test.mjs test/admin-image-preview.test.mjs test/directories.test.mjs test/public-file-id.test.mjs"
   },
   "overrides": {
     "fast-xml-parser": "^5.3.6"

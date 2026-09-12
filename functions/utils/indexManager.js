@@ -1,4 +1,5 @@
 import { savedDirectories } from './directories.js';
+import { registerPublicFile } from './publicFileId.js';
 /* 索引管理器 */
 
 /**
@@ -83,6 +84,7 @@ export async function addFileToIndex(context, fileId, metadata = null) {
         });
 
         console.log(`File ${fileId} add operation recorded with ID: ${operationId}`);
+        await registerPublicFile(env, fileId);
         return { success: true, operationId };
     } catch (error) {
         console.error('Error recording add file operation:', error);

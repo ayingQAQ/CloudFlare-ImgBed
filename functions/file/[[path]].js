@@ -10,6 +10,8 @@ import {
     returnWithCheck, return404, returnBlockImg, isDomainAllowed, FILE_CACHE_CONTROL
 } from './fileTools';
 import { getDatabase } from '../utils/databaseAdapter.js';
+import { isPublicFileId, resolvePublicFile } from '../utils/publicFileId.js';
+import { readIndex } from '../utils/indexManager.js';
 import { authenticate, AUTH_SCOPE } from '../utils/auth/authCore.js';
 import {
     resolveDiscordCredentials,
@@ -72,6 +74,12 @@ export async function onRequest(context) {  // Contents of context object
 
     // 从数据库中获取图片记录
     const db = getDatabase(env);
+    fileId = await resolvePublicFile(env, fileId, async () => {
+        const index = await readIndex(context, { count: -1, includeSubdirFiles: true });
+        if (!index.success) throw new Error('File index unavailable');
+        return index.files;
+    });
+    if (!fileId) return new Response('Error: Image Not Found', { status: 404 });
     const imgRecord = await db.getWithMetadata(fileId);
     if (!imgRecord) {
         return new Response('Error: Image Not Found', { status: 404 });
@@ -83,7 +91,7 @@ export async function onRequest(context) {  // Contents of context object
     }
 
     const fileName = imgRecord.metadata?.FileName || fileId;
-    const encodedFileName = encodeURIComponent(fileName);
+    const encodedFileName = encodeURIComponent(isPublicFileId(params.path) ? params.path : fileName);
     const fileType = imgRecord.metadata?.FileType || null;
 
     // 检查文件可访问状态
