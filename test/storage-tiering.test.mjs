@@ -88,6 +88,32 @@ test('routing switches R2 UI selection to HF; unavailable HF fails closed', asyn
     assert(!isAutomaticChannelRequest(new URL('https://test/upload?uploadChannel=cfr2&tiering=off')));
 });
 
+test('named API channels override tiering and never fall back to another store', async t => {
+    const { env } = environment(local(t));
+    env.R2_AUTO_TIER_LIMIT_GB = '0.000001';
+    for (const [name, type] of [['R2_env', 'cfr2'], ['HuggingFace_env', 'huggingface']]) {
+        for (const suffix of ['', `&uploadChannel=${type}&initChunked=true`]) {
+            const form = new FormData(); form.set('file', new Blob(['test']), 'test.png');
+            let called = false;
+            const response = await middleware[3]({ env,
+                request: new Request(`https://test/upload?channelName=${name}&autoRetry=true${suffix}`, { method: 'POST', body: form }),
+                next: async request => {
+                    called = true;
+                    const q = new URL(request.url).searchParams;
+                    assert.equal(q.get('uploadChannel'), type);
+                    assert.equal(q.get('channelName'), name);
+                    assert.equal(q.get('autoRetry'), 'false');
+                    return new Response('failure', { status: 500 });
+                } });
+            assert(called); assert.equal(response.status, 500);
+        }
+    }
+    const response = await middleware[3]({ env,
+        request: new Request('https://test/upload?channelName=missing', { method: 'POST', body: 'x' }),
+        next: () => assert.fail('unknown channel must not upload') });
+    assert.equal(response.status, 400);
+});
+
 test('middleware forwards rewritten Request and releases failed init reservations', async t => {
     const { env } = environment(local(t));
     env.R2_AUTO_TIER_LIMIT_GB = '0.002';
@@ -175,6 +201,13 @@ test('internal namespace cannot be selected as an upload directory', () => {
     for (const path of ['.imgbed-internal', '/.imgbed-internal/a', '%2eimgbed-internal', '\\.imgbed-internal']) {
         assert.throws(() => sanitizeUploadFolder(path), /Reserved/);
     }
+});
+
+test('upload folder preserves OpenList directory names with spaces and brackets', () => {
+    const folder = 'test-cn/测试目录 - 图片 [54P-480MB]';
+    assert.equal(sanitizeUploadFolder('/' + folder + '/'), folder);
+    assert.equal(sanitizeUploadFolder(encodeURIComponent(folder)), folder);
+    assert.equal(sanitizeUploadFolder('/test/../image'), 'test/_/image');
 });
 
 test('image preview failure does not block the recoverable Telegram document backup', async t => {

@@ -11,7 +11,7 @@
 # 无需手动编辑。详见 .github/workflows/deploy-worker.yml
 
 name = "cloudflare-imgbed"
-main = "index.js"
+main = "routes-entry.js"
 compatibility_date = "2024-08-21"
 # 让 Worker 对自身 zone 的 fetch() 走公网入口，不要直连 origin。
 compatibility_flags = ["global_fetch_strictly_public"]
@@ -32,18 +32,17 @@ not_found_handling = "single-page-application"
 binding = "IMAGES"
 
 [vars]
+ORIGIN_FALLBACK_MODE = "routes"
+ORIGIN_STATE_READY = "true"
+ORIGIN_BASE_URL = "https://origin-vps.imgb.top"
 # TG_BOT_TOKEN = ""
 # TG_CHAT_ID = ""
 
-# [[d1_databases]]
-# binding = "img_d1"
-# database_name = "img_d1"
-# database_id = ""
+[[d1_databases]]
+binding = "img_d1"
+database_name = "imgbed-shared"
+database_id = "c6ffa93f-e9db-49ca-af62-9b2f2adf4412"
 
 [[r2_buckets]]
 binding = "img_r2"
 bucket_name = "imgbed-r2"
-
-[[kv_namespaces]]
-binding = "img_url"
-id = "5f773d4c02c04820a7b36b8d08fedc21"

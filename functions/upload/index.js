@@ -13,6 +13,7 @@ import { HuggingFaceAPI } from "../utils/storage/huggingfaceAPI";
 import { WebDAVAPI } from "../utils/storage/webdavAPI";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getDatabase } from '../utils/databaseAdapter.js';
+import { registerPublicFile } from '../utils/publicFileId.js';
 
 
 export async function onRequest(context) {  // Contents of context object
@@ -273,10 +274,23 @@ async function processFileUpload(context, formdata = null) {
 }
 
 // 构建上传成功响应，自动附带 publicUrl（如果已配置）
-function buildUploadResponse(context, returnLink) {
-    const result = { src: returnLink };
+async function buildUploadResponse(context, returnLink) {
+    // Public aliases must be readable immediately after upload. D1 provides
+    // that consistency; KV may serve a 404 from another request/colo until
+    // its write propagates, so legacy KV deployments keep their old link.
+    if (!context.env.img_d1) {
+        return createResponse(JSON.stringify([{ src: returnLink, ...(context.publicUrl ? { publicUrl: context.publicUrl } : {}) }]), {
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+    const internalId = returnLink.split('/file/').pop();
+    const publicId = await registerPublicFile(context.env, internalId);
+    const publicLink = returnLink.startsWith('http')
+        ? `${new URL(returnLink).origin}/file/${publicId}`
+        : `/file/${publicId}`;
+    const result = { src: publicLink };
     if (context.publicUrl) {
-        result.publicUrl = context.publicUrl;
+        result.publicUrl = `${context.publicUrl.slice(0, context.publicUrl.lastIndexOf('/') + 1)}${publicId}`;
     }
     return createResponse(JSON.stringify([result]), {
         headers: {

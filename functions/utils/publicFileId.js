@@ -17,6 +17,11 @@ export async function registerPublicFile(env, id) {
     return alias;
 }
 
+export async function unregisterPublicFile(env, id) {
+    const alias = await publicFileId(id);
+    await getDatabase(env).delete(PREFIX + alias);
+}
+
 export async function relocatePublicFile(env, oldId, newId) {
     const db = getDatabase(env);
     const oldAlias = await publicFileId(oldId);

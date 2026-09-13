@@ -3,6 +3,7 @@ import { S3Client, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { purgeCFCache, purgeRandomFileListCache, purgePublicFileListCache } from "../../../utils/purgeCache";
 import { removeFileFromIndex, batchRemoveFilesFromIndex } from "../../../utils/indexManager.js";
 import { getDatabase } from '../../../utils/databaseAdapter.js';
+import { isPublicFileId, resolvePublicFile, unregisterPublicFile } from '../../../utils/publicFileId.js';
 import { DiscordAPI } from '../../../utils/storage/discordAPI.js';
 import { HuggingFaceAPI } from '../../../utils/storage/huggingfaceAPI.js';
 import { WebDAVAPI } from '../../../utils/storage/webdavAPI.js';
@@ -104,7 +105,12 @@ export async function onRequest(context) {
     try {
         // 解码params.path
         params.path = decodeURIComponent(params.path);
-        const fileId = params.path.split(',').join('/');
+        let fileId = params.path.split(',').join('/');
+        const requestedFileId = fileId;
+        if (isPublicFileId(fileId)) {
+            fileId = await resolvePublicFile(env, fileId, async () => []);
+            if (!fileId) throw new Error('File not found');
+        }
         const cdnUrl = `https://${url.hostname}/file/${fileId}`;
 
         const success = await deleteFile(env, fileId, cdnUrl, url);
@@ -113,6 +119,9 @@ export async function onRequest(context) {
         } else {
             // 从索引中删除文件
             waitUntil(removeFileFromIndex(context, fileId));
+            if (requestedFileId !== fileId) {
+                waitUntil(purgeCFCache(env, `https://${url.hostname}/file/${requestedFileId}`));
+            }
         }
 
         return new Response(JSON.stringify({
@@ -174,6 +183,7 @@ export async function deleteFile(env, fileId, cdnUrl, url) {
         // 删除数据库中的记录
         // 注意：容量统计现在由索引自动维护，删除文件后索引更新时会自动重新计算
         await db.delete(fileId);
+        await unregisterPublicFile(env, fileId);
 
         // 清除CDN缓存
         await purgeCFCache(env, cdnUrl);

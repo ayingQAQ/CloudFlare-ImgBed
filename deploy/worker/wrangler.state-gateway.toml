@@ -1,0 +1,13 @@
+name = "cloudflare-imgbed-state-gateway"
+main = "state-gateway.js"
+compatibility_date = "2024-08-21"
+workers_dev = true
+
+[[d1_databases]]
+binding = "img_d1"
+database_name = "imgbed-shared"
+database_id = "c6ffa93f-e9db-49ca-af62-9b2f2adf4412"
+
+[[r2_buckets]]
+binding = "img_r2"
+bucket_name = "imgbed-r2"

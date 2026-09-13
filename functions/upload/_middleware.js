@@ -13,6 +13,8 @@ import {
     backupFileIdToTelegram,
 } from '../utils/storageTiering.js';
 import { recordImageUpload } from '../utils/siteStats.js';
+import { fetchUploadConfig } from '../utils/sysConfig.js';
+import { isPublicFileId, resolvePublicFile } from '../utils/publicFileId.js';
 
 const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
@@ -73,7 +75,25 @@ async function storageTiering(context) {
 
     let downstreamRequest = originalRequest;
     let downstreamUrl = originalUrl;
-    const automaticRequest = isAutomaticChannelRequest(originalUrl);
+    // A named channel is an explicit API selection (OpenList sends only its name).
+    // Resolve it before automatic tiering, and fail closed rather than switching stores.
+    const channelName = originalUrl.searchParams.get('channelName');
+    if (channelName && !isChunkPart && !isMerge) {
+        const config = await fetchUploadConfig(context.env);
+        const requestedType = originalUrl.searchParams.get('uploadChannel');
+        const matches = Object.entries(config).filter(([type, value]) =>
+            (!requestedType || requestedType === type) &&
+            value?.channels?.some(channel => channel.name === channelName));
+        if (matches.length !== 1) {
+            return new Response('Unknown, disabled or ambiguous channel name', { status: 400 });
+        }
+        downstreamUrl = new URL(originalUrl);
+        downstreamUrl.searchParams.set('uploadChannel', matches[0][0]);
+        downstreamUrl.searchParams.set('tiering', 'off');
+        downstreamUrl.searchParams.set('autoRetry', 'false');
+        downstreamRequest = new Request(downstreamUrl, originalRequest);
+    }
+    const automaticRequest = isAutomaticChannelRequest(downstreamUrl);
     let reservationId;
     let anonymousReservation;
     const admin = await authenticate({ env: context.env, request: originalRequest, url: originalUrl, requiredPermission: 'upload', authScope: AUTH_SCOPE.ADMIN });
@@ -220,6 +240,9 @@ async function storageTiering(context) {
     let uploadedFileId;
     if (isFinalUpload && response.ok) {
         uploadedFileId = await extractUploadedFileId(response.clone());
+        if (isPublicFileId(uploadedFileId)) {
+            uploadedFileId = await resolvePublicFile(context.env, uploadedFileId, async () => []);
+        }
         if (uploadedFileId) {
             const record = await getDatabase(context.env).getWithMetadata(uploadedFileId);
             context.waitUntil(recordImageUpload(context.env.img_r2, record?.metadata));

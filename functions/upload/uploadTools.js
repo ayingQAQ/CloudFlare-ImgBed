@@ -168,8 +168,8 @@ export function sanitizeUploadFolder(folder) {
     const sanitizedSegments = segments
         .map(seg => {
             // 将路径段中的特殊字符替换为 _
-            // 特殊字符包括: \ : * ? " ' < > | 空格 ( ) [ ] { } # % ^ ` ~ ; @ & = + $ ,
-            return seg.replace(/[\\:\*\?"'<>\| \(\)\[\]\{\}#%\^`~;@&=\+\$,]/g, '_');
+            // 保留空格和方括号，使 OpenList 上传目录与后续 list 查询路径一致。
+            return seg.replace(/[\\:\*\?"'<>\|\(\)\{\}#%\^`~;@&=\+\$,]/g, '_');
         })
         .filter(seg => seg.length > 0); // 过滤空段
 

@@ -14,6 +14,8 @@ import { join, resolve, dirname } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { SqliteD1 } from './sqliteD1.js';
 import { LocalR2Storage } from './r2Storage.js';
+import { RemoteD1 } from './remoteD1.js';
+import { RemoteR2Storage } from './remoteR2.js';
 import { dockerImageProcessor } from './imageProcessor.js';
 
 const NativeResponse = globalThis.Response;
@@ -116,13 +118,21 @@ if (existsSync(migrationsDir)) {
 
 const r2Storage = new LocalR2Storage(join(DATA_DIR, 'r2'));
 
+const remoteStateConfigured = Boolean(process.env.STATE_GATEWAY_URL && process.env.STATE_GATEWAY_SECRET);
+const sharedD1 = remoteStateConfigured
+    ? new RemoteD1(process.env.STATE_GATEWAY_URL, process.env.STATE_GATEWAY_SECRET)
+    : sqliteD1;
+const sharedR2 = remoteStateConfigured
+    ? new RemoteR2Storage(process.env.STATE_GATEWAY_URL, process.env.STATE_GATEWAY_SECRET)
+    : r2Storage;
+
 // ==================== 创建环境对象 ====================
 
 function createEnv() {
     return {
         ...process.env,
-        img_d1: sqliteD1,
-        img_r2: r2Storage,
+        img_d1: sharedD1,
+        img_r2: sharedR2,
         IMAGE_PROCESSOR: dockerImageProcessor,
     };
 }
