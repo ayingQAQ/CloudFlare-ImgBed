@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - deploy/dual-backend-20260913
   workflow_dispatch:
     inputs:
       worker_name:
@@ -11,24 +12,9 @@ on:
         required: false
         default: ''
 
-# 所有配置均通过 Secrets 传入（public 仓库的 Variables 对所有人可见，不安全）
-#
-# 在仓库 Settings → Secrets and variables → Actions → Secrets 中配置：
-#
-# 必填：
-#   CLOUDFLARE_API_TOKEN  - Cloudflare API Token（需要 Workers 编辑权限）
-#   CLOUDFLARE_ACCOUNT_ID - Cloudflare Account ID
-#
-# 数据库（二选一）：
-#   D1_DATABASE_ID        - D1 数据库 ID
-#   KV_NAMESPACE_ID       - KV 命名空间 ID
-#
-# 可选：
-#   R2_BUCKET_NAME        - R2 存储桶名称
-#   WORKER_NAME           - Worker 名称（默认 cloudflare-imgbed，手动触发时可在界面覆盖）
-#   CUSTOM_DOMAIN         - Worker 自定义域名（例如 imgb.top）
-#   WORKER_VARS           - JSON 格式的业务环境变量（非必要不建议配置，
-#                           部署完成后请在管理面板中配置所有设置）
+# Production topology is versioned in deploy/worker/dual-backend.json.
+# Required secrets: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
+# Application secrets remain on the Worker (keep_vars=true).
 
 jobs:
   deploy:
@@ -50,6 +36,10 @@ jobs:
       - name: Checkout
         if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v6
+        with:
+          # Production uses the reviewed dual-backend branch, including shared
+          # D1/R2 bindings and Routes. Never deploy the legacy main entry point.
+          ref: deploy/dual-backend-20260913
 
       - name: Setup Node.js
         if: steps.check.outputs.skip != 'true'
@@ -67,14 +57,11 @@ jobs:
 
       - name: Generate wrangler config
         if: steps.check.outputs.skip != 'true'
-        env:
-          WORKER_NAME: ${{ inputs.worker_name || secrets.WORKER_NAME }}
-          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
-          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
-          WORKER_VARS: ${{ secrets.WORKER_VARS }}
-        run: node deploy/worker/generate-toml.js
+        run: |
+          test -f deploy/worker/dual-backend.json
+          node deploy/worker/generate-toml.js
+          grep -q 'main = "routes-entry.js"' deploy/worker/wrangler.toml
+          ! grep -Eq 'kv_namespaces|custom_domain' deploy/worker/wrangler.toml
 
       - name: Deploy to Cloudflare Workers
         if: steps.check.outputs.skip != 'true'
