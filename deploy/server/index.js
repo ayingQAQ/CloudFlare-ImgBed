@@ -15,7 +15,9 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import { SqliteD1 } from './sqliteD1.js';
 import { LocalR2Storage } from './r2Storage.js';
 import { RemoteD1 } from './remoteD1.js';
+import { publicRequest } from './public-request.js';
 import { RemoteR2Storage } from './remoteR2.js';
+import { ORIGIN_CHANNEL_KEY, ORIGIN_CHANNEL_FIELDS } from '../../functions/utils/originChannels.js';
 import { dockerImageProcessor } from './imageProcessor.js';
 
 const NativeResponse = globalThis.Response;
@@ -127,10 +129,20 @@ const sharedR2 = remoteStateConfigured
     : r2Storage;
 
 // ==================== 创建环境对象 ====================
+let originChannels = {};
+async function refreshOriginChannels() {
+    if (!remoteStateConfigured) return;
+    const row = await sharedD1.prepare('SELECT value FROM settings WHERE key = ?').bind(ORIGIN_CHANNEL_KEY).first();
+    if (!row) throw new Error('Shared origin channel configuration is missing');
+    const config = JSON.parse(row.value);
+    originChannels = Object.fromEntries(ORIGIN_CHANNEL_FIELDS.filter(key => config[key] !== undefined).map(key => [key, config[key]]));
+}
+await refreshOriginChannels();
 
 function createEnv() {
     return {
         ...process.env,
+        ...originChannels,
         img_d1: sharedD1,
         img_r2: sharedR2,
         IMAGE_PROCESSOR: dockerImageProcessor,
@@ -357,7 +369,7 @@ app.all('*', async (c, next) => {
         try {
             // 获取客户端真实 IP 并注入到请求 header 中
             // 因为 Node.js 环境没有 cf-connecting-ip 等 CDN header
-            let request = c.req.raw;
+            let request = publicRequest(c.req.raw);
             try {
                 const info = getConnInfo(c);
                 let clientIp = info.remote?.address;
@@ -413,7 +425,7 @@ let backupRunning = false;
 setInterval(async () => {
     if (backupRunning) return;
     backupRunning = true;
-    try { await drainTelegramBackups(createEnv()); }
+    try { await refreshOriginChannels(); await drainTelegramBackups(createEnv()); }
     catch (error) { console.error('Backup worker:', error.message); }
     finally { backupRunning = false; }
 }, 60000).unref();

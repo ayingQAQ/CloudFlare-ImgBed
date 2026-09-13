@@ -9,6 +9,12 @@ const enabled = {
 };
 const ctx = { passThroughOnException() {} };
 const req = () => new Request('https://imgb.top/api/manage/list');
+test('explicit origin mode streams writes once and preserves the public host', async()=>{
+    let calls=0;
+    const r=await withOriginFallback(new Request('https://www.imgb.top/upload',{method:'POST',body:'file-bytes'}),{...enabled,ORIGIN_PRIMARY:'true'},ctx,
+        ()=>{throw Error('primary must not execute');},async request=>{calls++;assert.equal(request.headers.get('x-forwarded-host'),'www.imgb.top');assert.equal(await request.text(),'file-bytes');return new Response('ok');});
+    assert.equal(r.status,200);assert.equal(calls,1);
+});
 test('disabled on current deployment, custom domains and unverified state', async () => {
     for (const env of [{}, { ORIGIN_FALLBACK_MODE: 'routes' }]) {
         let touched = false;
@@ -25,7 +31,7 @@ test('captures KV list quota even when the index layer swallows its exception', 
         return Response.json({ files: [] });
     }, async request => {
         count++;
-        assert.equal(request.url, 'https://origin-vps.imgb.top/api/manage/list');
+        assert.equal(request.url, 'https://origin-vps.imgb.top/api/manage/list?__imgbed_origin=2');
         assert.equal(request.headers.get('x-forwarded-host'), 'imgb.top');
         return new Response('origin');
     });

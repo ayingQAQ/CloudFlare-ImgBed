@@ -11,7 +11,7 @@
  *   WORKER_VARS      - JSON 格式的业务环境变量
  */
 
-import { writeFileSync } from 'fs';
+import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -21,6 +21,45 @@ const outputPath = join(__dirname, 'wrangler.toml');
 const env = process.env;
 const name = env.WORKER_NAME || 'cloudflare-imgbed';
 const tomlString = value => String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+const topologyPath = join(__dirname, 'dual-backend.json');
+if (existsSync(topologyPath)) {
+    const config = JSON.parse(readFileSync(topologyPath, 'utf8'));
+    const origin = new URL(config.origin);
+    if (origin.protocol !== 'https:' || config.hosts.includes(origin.hostname)) throw new Error('Origin must use a separate HTTPS hostname');
+    if (!config.databaseId || !config.bucketName || !config.hosts.length) throw new Error('Incomplete shared storage topology');
+    const q = value => JSON.stringify(String(value));
+    const routes = config.hosts.map(host => `{ pattern = ${q(host + '/*')}, zone_name = ${q(config.zoneName)} }`).join(', ');
+    const output = `# Generated from dual-backend.json; legacy KV/CUSTOM_DOMAIN secrets are intentionally ignored.
+name = ${q(config.name)}
+main = "routes-entry.js"
+compatibility_date = "2024-08-21"
+compatibility_flags = ["global_fetch_strictly_public"]
+keep_vars = true
+routes = [${routes}]
+[triggers]
+crons = ["* * * * *"]
+[assets]
+directory = "../../frontend-dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+[images]
+binding = "IMAGES"
+[vars]
+ORIGIN_FALLBACK_MODE = "routes"
+ORIGIN_STATE_READY = "true"
+ORIGIN_BASE_URL = ${q(config.origin)}
+[[d1_databases]]
+binding = "img_d1"
+database_name = ${q(config.databaseName)}
+database_id = ${q(config.databaseId)}
+[[r2_buckets]]
+binding = "img_r2"
+bucket_name = ${q(config.bucketName)}
+`;
+    writeFileSync(outputPath, output, 'utf8');
+    console.log('Generated shared D1/R2 Routes deployment configuration (secrets preserved).');
+    process.exit(0);
+}
 
 if (!env.D1_DATABASE_ID && !env.KV_NAMESPACE_ID) {
     throw new Error('Missing database binding: configure D1_DATABASE_ID or KV_NAMESPACE_ID');

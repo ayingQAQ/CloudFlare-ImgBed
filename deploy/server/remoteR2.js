@@ -1,4 +1,4 @@
-function encodeKey(key) { return encodeURIComponent(key); }
+const HTTP_METADATA = { contentType: 'content-type', contentLanguage: 'content-language', contentDisposition: 'content-disposition', contentEncoding: 'content-encoding', cacheControl: 'cache-control' };
 
 export class RemoteR2Storage {
     constructor(baseUrl, secret, fetcher = fetch) {
@@ -15,12 +15,13 @@ export class RemoteR2Storage {
         return url;
     }
     metadata(response) {
+        const httpMetadata = Object.fromEntries(Object.entries(HTTP_METADATA).filter(([,header]) => response.headers.has(header)).map(([key,header]) => [key,response.headers.get(header)]));
         return {
-            key: response.headers.get('x-r2-key') || '',
+            key: decodeURIComponent(response.headers.get('x-r2-key') || ''),
             size: Number(response.headers.get('x-r2-size') || 0),
             etag: response.headers.get('x-r2-etag') || '',
-            httpMetadata: {},
-            writeHttpMetadata() {},
+            httpMetadata,
+            writeHttpMetadata(headers) { for (const [key,value] of Object.entries(httpMetadata)) headers.set(HTTP_METADATA[key],value); },
         };
     }
     async head(key) {
@@ -39,8 +40,13 @@ export class RemoteR2Storage {
     async get(key, options) {
         const extra = options?.range ? { offset: options.range.offset || 0 } : {};
         if (options?.range?.length !== undefined) extra.length = options.range.length;
-        const response = await this.fetcher(this.url('/r2/object', key, extra), { headers: this.headers() });
+        if (options?.range?.suffix !== undefined) { delete extra.offset; extra.suffix = options.range.suffix; }
+        const headers = this.headers();
+        if (options?.onlyIf?.etagMatches) headers['x-r2-if-match'] = options.onlyIf.etagMatches;
+        if (options?.onlyIf?.etagDoesNotMatch) headers['x-r2-if-none-match'] = options.onlyIf.etagDoesNotMatch;
+        const response = await this.fetcher(this.url('/r2/object', key, extra), { headers });
         if (response.status === 404) return null;
+        if (response.status === 412) return this.metadata(response);
         if (!response.ok) throw new Error(`Remote R2 GET failed: ${response.status}`);
         const object = this.metadata(response);
         object.body = response.body;

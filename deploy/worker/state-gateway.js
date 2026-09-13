@@ -25,15 +25,16 @@ async function handleD1(request, env) {
 async function handleBackup(env) {
     const tables = ['files', 'settings', 'index_operations', 'index_metadata', 'other_data'];
     const snapshot = { format: 'imgbed-d1-json-v1', createdAt: new Date().toISOString(), tables: {} };
-    for (const table of tables) {
-        snapshot.tables[table] = (await env.img_d1.prepare(`SELECT * FROM ${table}`).all()).results || [];
-    }
+    // D1 batch executes in one transaction so related tables cannot be captured
+    // on opposite sides of a concurrent move/upload.
+    const results = await env.img_d1.batch(tables.map(table => env.img_d1.prepare(`SELECT * FROM ${table}`)));
+    tables.forEach((table, index) => { snapshot.tables[table] = results[index].results || []; });
     return json(snapshot);
 }
 
 function objectHeaders(object) {
     const headers = new Headers({
-        'x-r2-key': object.key || '',
+        'x-r2-key': encodeURIComponent(object.key || ''),
         'x-r2-size': String(object.size ?? 0),
         'x-r2-etag': object.etag || '',
     });
@@ -42,6 +43,7 @@ function objectHeaders(object) {
         headers.set('x-r2-range-length', String(object.range.length));
     }
     object.writeHttpMetadata?.(headers);
+    headers.set('cache-control', 'private, no-store');
     return headers;
 }
 
@@ -80,11 +82,16 @@ async function handleR2(request, env, url) {
     if (request.method === 'GET') {
         const offset = url.searchParams.get('offset');
         const length = url.searchParams.get('length');
-        const options = offset === null ? undefined : { range: { offset: Number(offset), length: Number(length) } };
+        const suffix = url.searchParams.get('suffix');
+        const options = {};
+        if (suffix !== null) options.range = { suffix: Number(suffix) };
+        else if (offset !== null) options.range = { offset: Number(offset), ...(length === null ? {} : { length: Number(length) }) };
+        if (request.headers.has('x-r2-if-match')) options.onlyIf = { etagMatches: request.headers.get('x-r2-if-match') };
+        if (request.headers.has('x-r2-if-none-match')) options.onlyIf = { ...options.onlyIf, etagDoesNotMatch: request.headers.get('x-r2-if-none-match') };
         const object = await env.img_r2.get(key, options);
         return object?.body
             ? new Response(object.body, { headers: objectHeaders(object) })
-            : new Response(null, { status: 404 });
+            : new Response(null, { status: object ? 412 : 404, headers: object ? objectHeaders(object) : { 'cache-control': 'no-store' } });
     }
     if (request.method === 'PUT') {
         const onlyIf = {};

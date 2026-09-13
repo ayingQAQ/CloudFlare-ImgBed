@@ -1,10 +1,13 @@
-// Candidate entry point for a future Routes deployment. Current production
-// wrangler.toml still uses index.js; this module is not live.
+// Production Routes entry point; metadata and storage are shared with origin.
 import application from './index.js';
+import { syncOriginChannels } from '../../functions/utils/originChannels.js';
 import { withOriginFallback } from './origin-fallback.js';
 
 export default {
-    scheduled: application.scheduled,
+    async scheduled(event, env, ctx) {
+        await syncOriginChannels(env);
+        return application.scheduled?.(event, env, ctx);
+    },
     fetch(request, env, ctx) {
         const url = new URL(request.url);
         let forwardedScheme = '';

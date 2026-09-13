@@ -685,7 +685,9 @@ async function handleR2File(context, fileId, encodedFileName, fileType) {
         const range = request.headers.get('Range');
         let object;
 
-        if (range) {
+        if (request.method === 'HEAD') {
+            object = await R2DataBase.head(fileId);
+        } else if (range) {
             // 处理Range请求
             const matches = range.match(/bytes=(\d+)-(\d*)/);
             if (matches) {
@@ -716,6 +718,8 @@ async function handleR2File(context, fileId, encodedFileName, fileType) {
         const headers = new Headers();
         object.writeHttpMetadata(headers);
         setCommonHeaders(headers, encodedFileName, fileType, getFileCacheControl(context));
+        headers.set('Content-Length', String(object.range?.length ?? object.size));
+        if (object.etag) headers.set('ETag', `"${object.etag}"`);
 
         // 处理HEAD请求
         if (request.method === 'HEAD') {

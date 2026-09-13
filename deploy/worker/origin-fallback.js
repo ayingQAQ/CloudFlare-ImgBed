@@ -49,10 +49,28 @@ export async function withOriginFallback(request, env, ctx, primary, originFetch
         && env.ORIGIN_STATE_READY === 'true'
         && env.ORIGIN_BASE_URL
         && eligibleHost;
-    if (!enabled || !retryableRead(request)) return primary(request, env, ctx);
+    if (!enabled) return primary(request, env, ctx);
+    const originBase = new URL(env.ORIGIN_BASE_URL);
+    if (originBase.protocol !== 'https:' || HOSTS.has(originBase.hostname) || originBase.hostname === hostname) {
+        return new Response('Invalid origin configuration', { status: 503 });
+    }
+    // Explicit failover mode sends each request once, including login and
+    // uploads. Never retry a mutation whose primary outcome is unknown.
+    if (env.ORIGIN_PRIMARY === 'true') {
+        try {
+            const originUrl = new URL(request.url);
+            originUrl.protocol = originBase.protocol; originUrl.host = originBase.host;
+            originUrl.searchParams.set('__imgbed_origin', '2');
+            const headers = new Headers(request.headers);
+            headers.set('x-forwarded-host', hostname);
+            headers.set('x-imgbed-public-host', hostname);
+            headers.set('x-forwarded-proto', 'https');
+            return await originFetch(new Request(originUrl, { method: request.method, headers, body: request.body, redirect: 'manual', duplex: 'half' }));
+        } catch { return new Response('Origin unavailable', { status: 503, headers: { 'cache-control': 'no-store' } }); }
+    }
+    if (!retryableRead(request)) return primary(request, env, ctx);
 
-    // Routes subrequests to the incoming URL reach the DNS origin. Do not
-    // rewrite to a Custom Domain or use a PRIMARY service binding here.
+    // Use the dedicated origin hostname, never the incoming routed hostname.
     ctx.passThroughOnException();
     const state = { kvQuota: false };
     let response;
@@ -67,8 +85,11 @@ export async function withOriginFallback(request, env, ctx, primary, originFetch
         const originBase = new URL(env.ORIGIN_BASE_URL);
         originUrl.protocol = originBase.protocol;
         originUrl.host = originBase.host;
+        originUrl.searchParams.set('__imgbed_origin', '2');
         const originHeaders = new Headers(request.headers);
         originHeaders.set('x-forwarded-host', new URL(request.url).host);
+        originHeaders.set('x-imgbed-public-host', hostname);
+        originHeaders.set('x-forwarded-proto', 'https');
         const originResponse = await originFetch(new Request(originUrl, {
             method: request.method,
             headers: originHeaders,

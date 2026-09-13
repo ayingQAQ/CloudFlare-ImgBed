@@ -1,0 +1,9 @@
+{
+  "name": "cloudflare-imgbed",
+  "databaseId": "c6ffa93f-e9db-49ca-af62-9b2f2adf4412",
+  "databaseName": "imgbed-shared",
+  "bucketName": "imgbed-r2",
+  "zoneName": "imgb.top",
+  "hosts": ["imgb.top", "www.imgb.top"],
+  "origin": "https://origin-vps.imgb.top"
+}
