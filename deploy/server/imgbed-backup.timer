@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily CloudFlare ImgBed backup
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+RandomizedDelaySec=15min
+Persistent=true
+Unit=imgbed-backup.service
+
+[Install]
+WantedBy=timers.target

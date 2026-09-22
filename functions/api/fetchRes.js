@@ -3,6 +3,7 @@
  * 负责在鉴权后拉取请求体中指定 URL 的资源并透传响应内容
  */
 import { dualAuthCheck } from '../utils/auth/dualAuth.js';
+import { isPublicHostname } from '../utils/publicAddress.js';
 
 const IS_NODE_RUNTIME = typeof process !== 'undefined' && Boolean(process.versions?.node);
 const HOP_BY_HOP_HEADERS = [
@@ -39,64 +40,13 @@ function createProxyHeaders(responseHeaders) {
     return headers;
 }
 
-function fetchTarget(url) {
-    const options = { redirect: 'manual' };
+function fetchTarget(url, env) {
+    const options = { redirect: 'manual', signal: AbortSignal.timeout(30000) };
     if (IS_NODE_RUNTIME) {
         options.headers = { 'Accept-Encoding': 'identity' };
     }
-    return fetch(url.toString(), options);
-}
-
-/**
- * Determine whether a hostname refers to a private, loopback, link-local,
- * cloud-metadata, or otherwise internal network address. Used to prevent
- * SSRF against internal services from the proxy endpoint.
- *
- * @param {string} hostname - hostname or IP literal from a parsed URL
- * @returns {boolean}
- */
-function isPrivateHostname(hostname) {
-    if (!hostname) return true;
-    let h = hostname.toLowerCase();
-    // Strip IPv6 brackets
-    if (h.startsWith('[') && h.endsWith(']')) {
-        h = h.slice(1, -1);
-    }
-
-    // Obvious local names
-    if (h === 'localhost' || h === 'ip6-localhost' || h === 'ip6-loopback') return true;
-    if (h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
-
-    // Cloud metadata service hostnames
-    if (h === 'metadata.google.internal' || h === 'metadata.goog') return true;
-
-    // IPv4 literal check
-    const ipv4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (ipv4) {
-        const [a, b] = [parseInt(ipv4[1], 10), parseInt(ipv4[2], 10)];
-        if (a === 10) return true;                              // 10.0.0.0/8
-        if (a === 127) return true;                             // loopback
-        if (a === 0) return true;                               // 0.0.0.0/8
-        if (a === 169 && b === 254) return true;                // link-local / AWS metadata 169.254.169.254
-        if (a === 172 && b >= 16 && b <= 31) return true;       // 172.16.0.0/12
-        if (a === 192 && b === 168) return true;                // 192.168.0.0/16
-        if (a === 100 && b >= 64 && b <= 127) return true;      // CGNAT 100.64.0.0/10
-        if (a >= 224) return true;                              // multicast / reserved
-        return false;
-    }
-
-    // IPv6 literal check (basic)
-    if (h.includes(':')) {
-        if (h === '::' || h === '::1') return true;
-        if (h.startsWith('fe80:') || h.startsWith('fe80::')) return true;   // link-local
-        if (h.startsWith('fc') || h.startsWith('fd')) return true;          // unique local fc00::/7
-        // IPv4-mapped IPv6 (::ffff:a.b.c.d)
-        const mapped = h.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-        if (mapped) return isPrivateHostname(mapped[1]);
-        return false;
-    }
-
-    return false;
+    if (IS_NODE_RUNTIME && !env.FETCH_PUBLIC_RESOURCE) throw new Error('Safe public fetch is unavailable');
+    return (env.FETCH_PUBLIC_RESOURCE || fetch)(url.toString(), options);
 }
 
 export async function onRequest(context) {
@@ -154,7 +104,7 @@ export async function onRequest(context) {
     }
 
     // Block private / loopback / link-local / metadata targets.
-    if (isPrivateHostname(parsed.hostname)) {
+    if (!isPublicHostname(parsed.hostname)) {
         return new Response(JSON.stringify({ error: 'Access to internal addresses is not allowed' }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' }
@@ -164,20 +114,22 @@ export async function onRequest(context) {
     // Follow redirects manually so a permitted host cannot redirect us onto
     // an internal address without re-validation.
     let currentUrl = parsed;
-    let response = await fetchTarget(currentUrl);
+    let response = await fetchTarget(currentUrl, env);
     let hops = 0;
     while (response.status >= 300 && response.status < 400 && response.headers.get('location') && hops < 5) {
         const next = new URL(response.headers.get('location'), currentUrl);
         if ((next.protocol !== 'http:' && next.protocol !== 'https:') ||
             next.username || next.password ||
-            isPrivateHostname(next.hostname)) {
+            !isPublicHostname(next.hostname)) {
+            await response.body?.cancel();
             return new Response(JSON.stringify({ error: 'Redirect to disallowed target' }), {
                 status: 400,
                 headers: { 'Content-Type': 'application/json' }
             });
         }
         currentUrl = next;
-        response = await fetchTarget(currentUrl);
+        await response.body?.cancel();
+        response = await fetchTarget(currentUrl, env);
         hops++;
     }
 

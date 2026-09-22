@@ -16,6 +16,7 @@ import { SqliteD1 } from './sqliteD1.js';
 import { LocalR2Storage } from './r2Storage.js';
 import { RemoteD1 } from './remoteD1.js';
 import { publicRequest } from './public-request.js';
+import { publicFetch } from './public-fetch.js';
 import { RemoteR2Storage } from './remoteR2.js';
 import { ORIGIN_CHANNEL_KEY, ORIGIN_CHANNEL_FIELDS } from '../../functions/utils/originChannels.js';
 import { dockerImageProcessor } from './imageProcessor.js';
@@ -137,7 +138,11 @@ async function refreshOriginChannels() {
     const config = JSON.parse(row.value);
     originChannels = Object.fromEntries(ORIGIN_CHANNEL_FIELDS.filter(key => config[key] !== undefined).map(key => [key, config[key]]));
 }
-await refreshOriginChannels();
+// Serve an explicit unavailable response while the gateway recovers instead of
+// crashing the process. Never fall back to an independent local database.
+let sharedStateReady = !remoteStateConfigured;
+try { await refreshOriginChannels(); sharedStateReady = true; }
+catch (error) { console.error('Shared state initialization pending:', error.message); }
 
 function createEnv() {
     return {
@@ -146,6 +151,7 @@ function createEnv() {
         img_d1: sharedD1,
         img_r2: sharedR2,
         IMAGE_PROCESSOR: dockerImageProcessor,
+        FETCH_PUBLIC_RESOURCE: publicFetch,
     };
 }
 
@@ -366,6 +372,7 @@ app.all('*', async (c, next) => {
 
     // 检查是否是 function 路径
     if (isFunctionPath(pathname)) {
+        if (!sharedStateReady) return new Response('Shared state temporarily unavailable', { status: 503, headers: { 'Retry-After': '30', 'Cache-Control': 'no-store' } });
         try {
             // 获取客户端真实 IP 并注入到请求 header 中
             // 因为 Node.js 环境没有 cf-connecting-ip 等 CDN header
@@ -425,7 +432,7 @@ let backupRunning = false;
 setInterval(async () => {
     if (backupRunning) return;
     backupRunning = true;
-    try { await refreshOriginChannels(); await drainTelegramBackups(createEnv()); }
+    try { await refreshOriginChannels(); sharedStateReady = true; await drainTelegramBackups(createEnv()); }
     catch (error) { console.error('Backup worker:', error.message); }
     finally { backupRunning = false; }
 }, 60000).unref();

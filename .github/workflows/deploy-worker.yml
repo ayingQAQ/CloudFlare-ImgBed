@@ -1,4 +1,7 @@
 name: Deploy to Cloudflare Workers
+concurrency:
+  group: imgbed-production
+  cancel-in-progress: false
 
 on:
   push:
@@ -49,7 +52,11 @@ jobs:
 
       - name: Install dependencies
         if: steps.check.outputs.skip != 'true'
-        run: npm ci --workspace=@cloudflare-imgbed/common --workspace=@cloudflare-imgbed/worker --omit=dev
+        run: npm ci
+
+      - name: Required regression tests
+        if: steps.check.outputs.skip != 'true'
+        run: npm test
 
       - name: Generate worker routes
         if: steps.check.outputs.skip != 'true'
@@ -62,6 +69,15 @@ jobs:
           node deploy/worker/generate-toml.js
           grep -q 'main = "routes-entry.js"' deploy/worker/wrangler.toml
           ! grep -Eq 'kv_namespaces|custom_domain' deploy/worker/wrangler.toml
+
+      - name: Deploy shared state gateway
+        if: steps.check.outputs.skip != 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4'
+          command: deploy --config deploy/worker/wrangler.state-gateway.toml
 
       - name: Deploy to Cloudflare Workers
         if: steps.check.outputs.skip != 'true'

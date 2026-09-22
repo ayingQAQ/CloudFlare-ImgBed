@@ -1,6 +1,14 @@
 // Opt-in only after BOTH DNS names use proxied origins and metadata/session
 // continuity has been verified. Never enable on a Worker Custom Domain.
 const HOSTS = new Set(['imgb.top', 'www.imgb.top']);
+const openUntil = new Map();
+export function resetOriginCircuit() { openUntil.clear(); }
+async function boundedOriginFetch(fetcher, request) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try { return await fetcher(new Request(request, { signal: controller.signal })); }
+    finally { clearTimeout(timer); }
+}
 
 export function isKvQuotaError(error) {
     const message = String(error?.message || error || '');
@@ -18,7 +26,7 @@ export function retryableRead(request) {
         return path === '/api/manage/list'
             && ['', 'info', 'index-storage-stats'].includes(url.searchParams.get('action') || '');
     }
-    return path === '/' || path === '/dashboard' || path === '/api/userConfig'
+    return ['/', '/dashboard', '/adminLogin', '/login', '/api/userConfig', '/api/channels', '/api/directoryTree', '/api/auth/sessionCheck'].includes(path)
         || path.startsWith('/file/') || /^\/(js|css|fonts|static)\//.test(path);
 }
 
@@ -56,7 +64,7 @@ export async function withOriginFallback(request, env, ctx, primary, originFetch
     }
     // Explicit failover mode sends each request once, including login and
     // uploads. Never retry a mutation whose primary outcome is unknown.
-    if (env.ORIGIN_PRIMARY === 'true') {
+    if (env.ORIGIN_PRIMARY === 'true' || (openUntil.get(hostname) || 0) > Date.now()) {
         try {
             const originUrl = new URL(request.url);
             originUrl.protocol = originBase.protocol; originUrl.host = originBase.host;
@@ -65,10 +73,19 @@ export async function withOriginFallback(request, env, ctx, primary, originFetch
             headers.set('x-forwarded-host', hostname);
             headers.set('x-imgbed-public-host', hostname);
             headers.set('x-forwarded-proto', 'https');
-            return await originFetch(new Request(originUrl, { method: request.method, headers, body: request.body, redirect: 'manual', duplex: 'half' }));
+            return await boundedOriginFetch(originFetch, new Request(originUrl, { method: request.method, headers, body: request.body, redirect: 'manual', duplex: 'half' }));
         } catch { return new Response('Origin unavailable', { status: 503, headers: { 'cache-control': 'no-store' } }); }
     }
-    if (!retryableRead(request)) return primary(request, env, ctx);
+    if (!retryableRead(request)) {
+        try {
+            const result = await primary(request, env, ctx);
+            if (result.status >= 500) openUntil.set(hostname, Date.now() + 30000);
+            return result;
+        } catch {
+            openUntil.set(hostname, Date.now() + 30000);
+            return new Response('Primary unavailable; subsequent requests will use origin', { status: 503, headers: { 'Cache-Control': 'no-store' } });
+        }
+    }
 
     // Use the dedicated origin hostname, never the incoming routed hostname.
     ctx.passThroughOnException();
@@ -77,7 +94,9 @@ export async function withOriginFallback(request, env, ctx, primary, originFetch
     try {
         response = await primary(request, observeKv(env, state), ctx);
         if (!state.kvQuota && response.status < 500) return response;
+        openUntil.set(hostname, Date.now() + 30000);
     } catch {
+        openUntil.set(hostname, Date.now() + 30000);
         // Only replay the read-only allowlist. No upload body is cloned/buffered.
     }
     try {
@@ -90,7 +109,7 @@ export async function withOriginFallback(request, env, ctx, primary, originFetch
         originHeaders.set('x-forwarded-host', new URL(request.url).host);
         originHeaders.set('x-imgbed-public-host', hostname);
         originHeaders.set('x-forwarded-proto', 'https');
-        const originResponse = await originFetch(new Request(originUrl, {
+        const originResponse = await boundedOriginFetch(originFetch, new Request(originUrl, {
             method: request.method,
             headers: originHeaders,
             redirect: 'manual',

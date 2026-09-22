@@ -36,8 +36,20 @@ export async function relocatePublicFile(env, oldId, newId) {
 export async function resolvePublicFile(env, alias, loadFiles) {
     if (!isPublicFileId(alias)) return alias;
     const db = getDatabase(env);
-    const existing = await db.get(PREFIX + alias);
-    if (existing) return existing;
+    let existing = await db.get(PREFIX + alias);
+    if (existing) {
+        const seen = new Set([alias]);
+        for (let depth = 0; depth < 64; depth++) {
+            const nextAlias = await publicFileId(existing);
+            if (depth === 0 && nextAlias === alias) return existing;
+            if (seen.has(nextAlias)) return null;
+            seen.add(nextAlias);
+            const next = await db.get(PREFIX + nextAlias);
+            if (!next || next === existing) return existing;
+            existing = next;
+        }
+        throw new Error('Public link relocation chain is too long');
+    }
     // Old files receive aliases on first use, without moving their storage objects.
     const files = await loadFiles();
     for (const file of files) {

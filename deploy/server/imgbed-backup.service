@@ -1,0 +1,12 @@
+[Unit]
+Description=CloudFlare ImgBed metadata and configuration backup
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=vpsadmin
+WorkingDirectory=/opt/cloudflare-imgbed
+ExecStart=/usr/bin/flock -n /opt/cloudflare-imgbed/.backup.lock /opt/cloudflare-imgbed/backup.sh
+TimeoutStartSec=10min
+UMask=0077

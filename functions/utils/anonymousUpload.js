@@ -12,7 +12,8 @@ async function ipHash(request) {
     const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
     const visitorId = request.headers.get('X-Visitor-ID') || '';
     const validVisitorId = /^[0-9a-f-]{36}$/i.test(visitorId) ? visitorId : '';
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${ip}:${validVisitorId}`));
+    const identity = request.headers.get('x-imgbed-visitor-verified') === 'true' ? validVisitorId : `${ip}:${validVisitorId}`;
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity));
     return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
 }
 

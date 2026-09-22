@@ -15,6 +15,7 @@ import {
 import { recordImageUpload } from '../utils/siteStats.js';
 import { fetchUploadConfig } from '../utils/sysConfig.js';
 import { isPublicFileId, resolvePublicFile } from '../utils/publicFileId.js';
+import { visitorIdentity } from '../utils/visitorIdentity.js';
 
 const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
@@ -266,6 +267,7 @@ async function storageTiering(context) {
 export const onRequest = [
     checkDatabaseConfig,
     handleOptions,
+    visitorIdentity,
     errorHandling,
     storageTiering,
     telemetryData,

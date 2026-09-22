@@ -2,9 +2,16 @@ import { fetchSecurityConfig } from "../../utils/sysConfig.js";
 import { verifyPassword, rehashIfNeeded } from "../../utils/auth/passwordHash.js";
 import { createSession } from "../../utils/auth/sessionManager.js";
 import { getDatabase } from "../../utils/databaseAdapter.js";
+import { takeRateLimit, clientAddress } from '../../utils/rateLimit.js';
 
 export async function onRequestPost(context) {
     const { request, env } = context;
+    try {
+        const admission = await takeRateLimit(env.img_r2, 'admin-login:' + clientAddress(request), 10, 10 * 60 * 1000);
+        if (!admission.allowed) return Response.json({ error: 'Too many login attempts' }, { status: 429, headers: { 'Retry-After': String(admission.retryAfter), 'Cache-Control': 'no-store' } });
+    } catch {
+        return Response.json({ error: 'Login temporarily unavailable' }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
+    }
 
     const { username, password } = await request.json();
 

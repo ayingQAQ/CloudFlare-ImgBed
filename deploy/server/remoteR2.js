@@ -4,7 +4,7 @@ export class RemoteR2Storage {
     constructor(baseUrl, secret, fetcher = fetch) {
         this.baseUrl = baseUrl.replace(/\/$/, '');
         this.secret = secret;
-        this.fetcher = fetcher;
+        this.fetcher = (url, init = {}) => fetcher(url, { ...init, signal: init.signal || AbortSignal.timeout(120000) });
     }
 
     headers(extra = {}) { return { authorization: `Bearer ${this.secret}`, ...extra }; }
@@ -58,6 +58,7 @@ export class RemoteR2Storage {
     }
     async put(key, value, options = {}) {
         const headers = this.headers();
+        headers['x-r2-metadata'] = encodeURIComponent(JSON.stringify({ httpMetadata: options.httpMetadata, customMetadata: options.customMetadata }));
         if (options.onlyIf?.etagMatches) headers['x-r2-if-match'] = options.onlyIf.etagMatches;
         if (options.onlyIf?.etagDoesNotMatch) headers['x-r2-if-none-match'] = options.onlyIf.etagDoesNotMatch;
         const response = await this.fetcher(this.url('/r2/object', key), { method: 'PUT', headers, body: value, duplex: 'half' });

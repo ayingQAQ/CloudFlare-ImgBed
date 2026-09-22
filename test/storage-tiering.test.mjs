@@ -95,7 +95,7 @@ test('named API channels override tiering and never fall back to another store',
         for (const suffix of ['', `&uploadChannel=${type}&initChunked=true`]) {
             const form = new FormData(); form.set('file', new Blob(['test']), 'test.png');
             let called = false;
-            const response = await middleware[3]({ env,
+            const response = await middleware.find(fn => fn.name === 'storageTiering')({ env,
                 request: new Request(`https://test/upload?channelName=${name}&autoRetry=true${suffix}`, { method: 'POST', body: form }),
                 next: async request => {
                     called = true;
@@ -108,7 +108,7 @@ test('named API channels override tiering and never fall back to another store',
             assert(called); assert.equal(response.status, 500);
         }
     }
-    const response = await middleware[3]({ env,
+    const response = await middleware.find(fn => fn.name === 'storageTiering')({ env,
         request: new Request('https://test/upload?channelName=missing', { method: 'POST', body: 'x' }),
         next: () => assert.fail('unknown channel must not upload') });
     assert.equal(response.status, 400);
@@ -120,7 +120,7 @@ test('middleware forwards rewritten Request and releases failed init reservation
     let called = false;
     const form = new FormData(); form.set('file', new Blob([new Uint8Array(MB)]), 'x');
     const request = new Request('https://test/upload?uploadChannel=cfr2', { method: 'POST', body: form });
-    const response = await middleware[3]({ env, request, next: async downstream => {
+    const response = await middleware.find(fn => fn.name === 'storageTiering')({ env, request, next: async downstream => {
         called = true;
         assert.equal(new URL(downstream.url).searchParams.get('uploadChannel'), 'huggingface');
         assert.equal(new URL(downstream.url).searchParams.get('autoRetry'), 'false');
@@ -130,7 +130,7 @@ test('middleware forwards rewritten Request and releases failed init reservation
     env.R2_AUTO_TIER_LIMIT_GB = '10';
     const init = new FormData(); init.set('totalChunks', '1');
     let id;
-    await middleware[3]({ env, request: new Request('https://test/upload?initChunked=true', { method: 'POST', body: init }),
+    await middleware.find(fn => fn.name === 'storageTiering')({ env, request: new Request('https://test/upload?initChunked=true', { method: 'POST', body: init }),
         next: async downstream => { id = new URL(downstream.url).searchParams.get('tieringReservation'); return new Response('fail', { status: 400 }); } });
     assert(id); await assert.rejects(checkR2Reservation(env.img_r2, id));
 });

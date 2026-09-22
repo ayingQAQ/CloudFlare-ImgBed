@@ -1,6 +1,7 @@
-import test from 'node:test';
+import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { withOriginFallback, retryableRead, isKvQuotaError } from '../deploy/worker/origin-fallback.js';
+import { withOriginFallback, retryableRead, isKvQuotaError, resetOriginCircuit } from '../deploy/worker/origin-fallback.js';
+beforeEach(resetOriginCircuit);
 
 const enabled = {
     ORIGIN_FALLBACK_MODE: 'routes',
@@ -50,11 +51,22 @@ test('GET mutations and POST uploads are never automatically replayed', async ()
         new Request('https://imgb.top/api/manage/list?action=rebuild'),
         new Request('https://imgb.top/upload', { method: 'POST', body: 'image' })]) {
         assert.equal(retryableRead(request), false);
+        resetOriginCircuit();
         const result = await withOriginFallback(request, enabled, ctx,
             async () => new Response('failure', { status: 500 }),
             async () => { throw Error('must not call'); });
         assert.equal(result.status, 500);
     }
+});
+
+test('failed write is not replayed; the next request can use origin once', async () => {
+    let writes = 0, origins = 0;
+    const primary = async () => { writes++; return new Response('failure', { status: 503 }); };
+    const origin = async request => { origins++; assert.equal(await request.text(), 'second'); return new Response('ok'); };
+    const first = await withOriginFallback(new Request('https://imgb.top/upload', { method: 'POST', body: 'first' }), enabled, ctx, primary, origin);
+    assert.equal(first.status, 503); assert.equal(origins, 0);
+    const second = await withOriginFallback(new Request('https://imgb.top/upload', { method: 'POST', body: 'second' }), enabled, ctx, primary, origin);
+    assert.equal(second.status, 200); assert.equal(writes, 1); assert.equal(origins, 1);
 });
 test('both intended domains are eligible; a different domain is not', async () => {
     for (const hostname of ['imgb.top', 'www.imgb.top', 'staging.workers.dev']) {

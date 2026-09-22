@@ -97,7 +97,8 @@ async function handleR2(request, env, url) {
         const onlyIf = {};
         if (request.headers.has('x-r2-if-match')) onlyIf.etagMatches = request.headers.get('x-r2-if-match');
         if (request.headers.has('x-r2-if-none-match')) onlyIf.etagDoesNotMatch = request.headers.get('x-r2-if-none-match');
-        const options = Object.keys(onlyIf).length ? { onlyIf } : undefined;
+        const metadata = JSON.parse(decodeURIComponent(request.headers.get('x-r2-metadata') || '%7B%7D'));
+        const options = { ...metadata, ...(Object.keys(onlyIf).length ? { onlyIf } : {}) };
         const object = await env.img_r2.put(key, request.body, options);
         return object ? new Response(null, { headers: objectHeaders(object) }) : new Response(null, { status: 412 });
     }

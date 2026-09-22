@@ -12,6 +12,7 @@ export class RemoteD1 {
     async execute(method, sql, params, column) {
         const response = await this.fetcher(this.url, {
             method: 'POST',
+            signal: AbortSignal.timeout(15000),
             headers: { authorization: `Bearer ${this.secret}`, 'content-type': 'application/json' },
             body: JSON.stringify({ method, sql, params, column }),
         });
