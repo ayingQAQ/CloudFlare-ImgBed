@@ -2,7 +2,7 @@ name: Storage tiering regression tests
 on:
   pull_request:
   push:
-    branches: [main, feature/r2-hf-tg-storage-tiering]
+    branches: [main, feature/r2-hf-tg-storage-tiering, deploy/dual-backend-20260913]
 permissions:
   contents: read
 jobs:
@@ -10,12 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref_name == 'main' && 'deploy/dual-backend-20260913' || github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm run test:storage
+      - run: npm test
       - run: node deploy/worker/generate-routes.js
       - run: git diff --exit-code -- deploy/worker/index.js
       - run: npx wrangler deploy --dry-run --config deploy/worker/wrangler.toml
