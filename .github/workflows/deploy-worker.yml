@@ -42,7 +42,7 @@ jobs:
         with:
           # Production uses the reviewed dual-backend branch, including shared
           # D1/R2 bindings and Routes. Never deploy the legacy main entry point.
-          ref: deploy/dual-backend-20260913
+          ref: ${{ github.ref_name == 'deploy/dual-backend-20260913' && github.sha || 'deploy/dual-backend-20260913' }}
 
       - name: Setup Node.js
         if: steps.check.outputs.skip != 'true'
