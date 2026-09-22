@@ -55,6 +55,11 @@ database_id = ${q(config.databaseId)}
 [[r2_buckets]]
 binding = "img_r2"
 bucket_name = ${q(config.bucketName)}
+
+[[durable_objects.bindings]]
+name = "HF_COMMITS"
+class_name = "HFCommitCoordinator"
+script_name = "cloudflare-imgbed-state-gateway"
 `;
     writeFileSync(outputPath, output, 'utf8');
     console.log('Generated shared D1/R2 Routes deployment configuration (secrets preserved).');

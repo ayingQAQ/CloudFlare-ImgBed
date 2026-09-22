@@ -3,9 +3,16 @@
 const HOSTS = new Set(['imgb.top', 'www.imgb.top']);
 const openUntil = new Map();
 export function resetOriginCircuit() { openUntil.clear(); }
+export function originRequestTimeout(request) {
+    const path = new URL(request.url).pathname;
+    // HF commits may wait for the shared repository coordinator. Reads retain
+    // their short failover deadline; mutations are still never replayed.
+    return request.method === 'POST' && (path === '/upload' || path === '/upload/huggingface/commitUpload')
+        ? 110000 : 15000;
+}
 async function boundedOriginFetch(fetcher, request) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    const timer = setTimeout(() => controller.abort(), originRequestTimeout(request));
     try { return await fetcher(new Request(request, { signal: controller.signal })); }
     finally { clearTimeout(timer); }
 }

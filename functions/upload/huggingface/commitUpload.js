@@ -89,7 +89,7 @@ export async function onRequestPost(context) {
             });
         }
 
-        const huggingfaceAPI = new HuggingFaceAPI(hfChannel.token, hfChannel.repo, hfChannel.isPrivate || false);
+        const huggingfaceAPI = new HuggingFaceAPI(hfChannel.token, hfChannel.repo, hfChannel.isPrivate || false, env);
 
         // 提交 LFS 文件引用
         console.log('Committing LFS file...');
@@ -189,8 +189,8 @@ export async function onRequestPost(context) {
         if (isAnonymous) await finishAnonymousUpload(env.img_r2, request, anonymousReservation, false);
         console.error('commitUpload error:', error.message);
         return createResponse(JSON.stringify({ error: error.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json' }
+            status: error.status === 429 ? 429 : 500,
+            headers: { 'Content-Type': 'application/json', ...(error.retryAfter ? { 'Retry-After': error.retryAfter } : {}) }
         });
     }
 }

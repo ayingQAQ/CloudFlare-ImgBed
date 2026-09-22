@@ -1,3 +1,5 @@
+export { HFCommitCoordinator } from '../../functions/utils/storage/hfCommitCoordinator.js';
+
 function unauthorized() {
     return new Response('Unauthorized', { status: 401, headers: { 'cache-control': 'no-store' } });
 }
@@ -116,6 +118,14 @@ export default {
         }
         try {
             const url = new URL(request.url);
+            if (url.pathname === '/hf/commit' && request.method === 'POST') {
+                const body = await request.json();
+                if (!/^[\w.-]+\/[\w.-]+$/.test(body.repo || '')) return json({ error: 'Invalid repo' }, 400);
+                const id = env.HF_COMMITS.idFromName(body.repo);
+                return env.HF_COMMITS.get(id).fetch('https://hf-commit/submit', {
+                    method: 'POST', body: JSON.stringify(body)
+                });
+            }
             if (url.pathname === '/backup' && request.method === 'GET') return await handleBackup(env);
             if (url.pathname === '/d1' && request.method === 'POST') return await handleD1(request, env);
             if (url.pathname.startsWith('/r2/')) return await handleR2(request, env, url);

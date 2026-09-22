@@ -740,7 +740,7 @@ async function uploadFileToHuggingFace(context, fullId, metadata, returnLink) {
         : `${fullId.substring(0, lastSlashIndex + 1)}${uniquePrefix}_${fullId.substring(lastSlashIndex + 1)}`;
     console.log('HuggingFace file path:', hfFilePath);
 
-    const huggingfaceAPI = new HuggingFaceAPI(hfChannel.token, hfChannel.repo, hfChannel.isPrivate || false);
+        const huggingfaceAPI = new HuggingFaceAPI(hfChannel.token, hfChannel.repo, hfChannel.isPrivate || false, env);
 
     try {
         // 上传文件到 HuggingFace（传入预计算的 SHA256）
@@ -794,7 +794,10 @@ async function uploadFileToHuggingFace(context, fullId, metadata, returnLink) {
 
     } catch (error) {
         console.error('HuggingFace upload error:', error.message);
-        return createResponse(`Error: HuggingFace upload failed - ${error.message}`, { status: 500 });
+        return createResponse(`Error: HuggingFace upload failed - ${error.message}`, {
+            status: error.status === 429 ? 429 : 500,
+            headers: error.retryAfter ? { 'Retry-After': error.retryAfter } : {}
+        });
     }
 }
 

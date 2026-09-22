@@ -112,7 +112,7 @@ export async function onRequestPost(context) {
             : `${fullId.substring(0, lastSlashIndex + 1)}${uniquePrefix}_${fullId.substring(lastSlashIndex + 1)}`;
 
         // 获取 LFS 上传信息
-        const huggingfaceAPI = new HuggingFaceAPI(hfChannel.token, hfChannel.repo, hfChannel.isPrivate || false);
+        const huggingfaceAPI = new HuggingFaceAPI(hfChannel.token, hfChannel.repo, hfChannel.isPrivate || false, env);
         const uploadInfo = await huggingfaceAPI.getLfsUploadInfo(fileSize, filePath, sha256, fileSample);
         rewriteMultipartCompletionUrl(url, uploadInfo);
 
@@ -135,8 +135,8 @@ export async function onRequestPost(context) {
         await finishAnonymousUpload(env.img_r2, request, anonymousReservation, false);
         console.error('getUploadUrl error:', error.message);
         return createResponse(JSON.stringify({ error: error.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json' }
+            status: error.status === 429 ? 429 : 500,
+            headers: { 'Content-Type': 'application/json', ...(error.retryAfter ? { 'Retry-After': error.retryAfter } : {}) }
         });
     }
 }
