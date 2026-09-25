@@ -1,5 +1,6 @@
 import { fetchOthersConfig } from "../utils/sysConfig";
 import { readIndex } from "../utils/indexManager";
+import { getDatabase } from '../utils/databaseAdapter.js';
 import { detectDevice, resolveOrientation, addClientHintsHeaders } from "./adaptive.js";
 
 // CORS 跨域响应头
@@ -9,9 +10,6 @@ const corsHeaders = {
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Max-Age': '86400',
 };
-
-let othersConfig = {};
-let allowRandom = false;
 
 export async function onRequest(context) {
     // Contents of context object
@@ -31,8 +29,8 @@ export async function onRequest(context) {
     }
 
     // 读取其他设置
-    othersConfig = await fetchOthersConfig(env);
-    allowRandom = othersConfig.randomImageAPI.enabled;
+    const othersConfig = await fetchOthersConfig(env);
+    const allowRandom = othersConfig.randomImageAPI.enabled;
     const allowedDir = othersConfig.randomImageAPI.allowedDir;
 
     // 检查是否启用了随机图功能
@@ -90,38 +88,47 @@ export async function onRequest(context) {
     }
 
     // 调用randomFileList接口，读取KV数据库中的所有记录
-    let allRecords = await getRandomFileList(context, requestUrl, dir);
+    let allRecords;
+    const db = getDatabase(env);
+    if (typeof db.queryFiles === 'function') {
+        const options = { directory: dir, includeSubdirFiles: true, accessStatus: 'normal', mimeIncludes: fileType, orientation, random: true };
+        let result = await db.queryFiles(options);
+        if (isAutoMode && orientation && !result.files.length) result = await db.queryFiles({ ...options, orientation: '' });
+        allRecords = result.files.map(file => ({ name: file.id, FileType: file.metadata?.FileType, Width: file.metadata?.Width, Height: file.metadata?.Height }));
+    } else {
+        allRecords = await getRandomFileList(context, requestUrl, dir);
 
-    // 筛选出符合fileType要求的记录
-    allRecords = allRecords.filter(item => { return fileType.some(type => item.FileType?.includes(type)) });
+        // 筛选出符合fileType要求的记录
+        allRecords = allRecords.filter(item => { return fileType.some(type => item.FileType?.includes(type)) });
 
-    // 保存过滤前的记录，用于自适应模式降级
-    const allRecordsBeforeOrientationFilter = allRecords;
+        // 保存过滤前的记录，用于自适应模式降级
+        const allRecordsBeforeOrientationFilter = allRecords;
 
-    // 根据图片方向筛选
-    if (orientation && allRecords.length > 0) {
-        const SQUARE_THRESHOLD = 0.1; // 宽高比差异小于10%视为方图
-        allRecords = allRecords.filter(item => {
-            // 如果没有尺寸信息，跳过该记录
-            if (!item.Width || !item.Height) return false;
+        // 根据图片方向筛选
+        if (orientation && allRecords.length > 0) {
+            const SQUARE_THRESHOLD = 0.1; // 宽高比差异小于10%视为方图
+            allRecords = allRecords.filter(item => {
+                // 如果没有尺寸信息，跳过该记录
+                if (!item.Width || !item.Height) return false;
 
-            const ratio = item.Width / item.Height;
-            switch (orientation) {
-                case 'landscape': // 横图：宽 > 高
-                    return ratio > (1 + SQUARE_THRESHOLD);
-                case 'portrait': // 竖图：高 > 宽
-                    return ratio < (1 - SQUARE_THRESHOLD);
-                case 'square': // 方图：宽 ≈ 高
-                    return ratio >= (1 - SQUARE_THRESHOLD) && ratio <= (1 + SQUARE_THRESHOLD);
-                default:
-                    return true;
-            }
-        });
-    }
+                const ratio = item.Width / item.Height;
+                switch (orientation) {
+                    case 'landscape': // 横图：宽 > 高
+                        return ratio > (1 + SQUARE_THRESHOLD);
+                    case 'portrait': // 竖图：高 > 宽
+                        return ratio < (1 - SQUARE_THRESHOLD);
+                    case 'square': // 方图：宽 ≈ 高
+                        return ratio >= (1 - SQUARE_THRESHOLD) && ratio <= (1 + SQUARE_THRESHOLD);
+                    default:
+                        return true;
+                }
+            });
+        }
 
-    // 自适应模式降级：过滤后无匹配图片时，降级到全部图片
-    if (isAutoMode && orientation && allRecords.length === 0) {
-        allRecords = allRecordsBeforeOrientationFilter;
+        // 自适应模式降级：过滤后无匹配图片时，降级到全部图片
+        if (isAutoMode && orientation && allRecords.length === 0) {
+            allRecords = allRecordsBeforeOrientationFilter;
+        }
     }
 
     // 构建响应头：添加 CORS 跨域响应头，自适应模式下添加 Client Hints 协商头
@@ -150,17 +157,15 @@ export async function onRequest(context) {
         if (randomType == 'img') {
             // Return an image response
             randomUrl = requestUrl.origin + randomPath;
-            let contentType = 'image/jpeg';
+            const upstream = await fetch(randomUrl, { signal: request.signal });
+            const contentType = upstream.headers.get('content-type');
             const imgHeaders = new Headers(responseHeaders);
-            return new Response(await fetch(randomUrl).then(res => {
-                contentType = res.headers.get('content-type');
-                return res.blob();
-            }), {
+            return new Response(upstream.body, {
                 headers: (() => {
                     imgHeaders.set('Content-Type', contentType || 'image/jpeg');
                     return imgHeaders;
                 })(),
-                status: 200
+                status: upstream.status
             });
         }
         
@@ -196,10 +201,9 @@ async function getRandomFileList(context, url, dir) {
     await cache.put(`${url.origin}/api/randomFileList?dir=${dir}`, new Response(JSON.stringify(allRecords), {
         headers: {
             "Content-Type": "application/json",
+            "Cache-Control": "public, max-age=300",
         }
-    }), {
-        expirationTtl: 24 * 60 * 60
-    });
+    }));
     
     return allRecords;
 }

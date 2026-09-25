@@ -1,3 +1,4 @@
+import { getUploadForm } from '../upload/uploadRequest.js';
 import { fetchUploadConfig } from './sysConfig.js';
 import { reserveR2 } from './r2Capacity.js';
 import { getDatabase } from './databaseAdapter.js';
@@ -49,56 +50,45 @@ function normalizePrimaryChannel(channel) {
     return value;
 }
 
-async function estimateIncomingBytes(request, url) {
-    if (url.searchParams.get('initChunked') !== 'true') {
-        const contentLength = Number(request.headers.get('content-length'));
-        if (Number.isFinite(contentLength) && contentLength > 0) {
-            return contentLength;
+async function estimateIncomingBytes(context, request, url) {
+    const formdata = await getUploadForm(context, request);
+    const actualFile = formdata.get('file');
+    if (actualFile && typeof actualFile.size === 'number') return actualFile.size;
+    const sizeFields = ['originalFileSize', 'fileSizeBytes', 'totalSize', 'fileSize'];
+    for (const key of sizeFields) {
+        const value = Number(formdata.get(key));
+        if (Number.isFinite(value) && value > 0) {
+            if (key === 'fileSize' && value < BINARY_MB) {
+                return value * BINARY_MB;
+            }
+            return value;
         }
     }
 
-    try {
-        const formdata = await request.clone().formData();
-        const actualFile = formdata.get('file');
-        if (actualFile && typeof actualFile.size === 'number') return actualFile.size;
-        const sizeFields = ['originalFileSize', 'fileSizeBytes', 'totalSize', 'fileSize'];
-        for (const key of sizeFields) {
-            const value = Number(formdata.get(key));
-            if (Number.isFinite(value) && value > 0) {
-                if (key === 'fileSize' && value < BINARY_MB) {
-                    return value * BINARY_MB;
-                }
-                return value;
-            }
-        }
+    const file = formdata.get('file');
+    if (file && typeof file.size === 'number') {
+        return file.size;
+    }
 
-        const file = formdata.get('file');
-        if (file && typeof file.size === 'number') {
-            return file.size;
+    // The existing frontend does not send originalFileSize when it initializes
+    // an R2 multipart upload. Estimate conservatively from totalChunks so a large
+    // upload cannot start at 94.x% and silently push R2 beyond the 95% safety line.
+    if (url.searchParams.get('initChunked') === 'true') {
+        const totalChunks = Number(formdata.get('totalChunks'));
+        if (Number.isInteger(totalChunks) && totalChunks > 0) {
+            return totalChunks * AUTOMATIC_R2_CHUNK_SIZE;
         }
-
-        // The existing frontend does not send originalFileSize when it initializes
-        // an R2 multipart upload. Estimate conservatively from totalChunks so a large
-        // upload cannot start at 94.x% and silently push R2 beyond the 95% safety line.
-        if (url.searchParams.get('initChunked') === 'true') {
-            const totalChunks = Number(formdata.get('totalChunks'));
-            if (Number.isInteger(totalChunks) && totalChunks > 0) {
-                return totalChunks * AUTOMATIC_R2_CHUNK_SIZE;
-            }
-        }
-    } catch (error) {
-        console.warn('Storage tiering: failed to estimate upload size:', error.message);
     }
 
     return 0;
 }
 
 export async function resolveAutomaticPrimary(context, request = context.request) {
-    const config = await fetchUploadConfig(context.env);
+    const config = await fetchUploadConfig(context.env, context);
     const r2 = config.cfr2?.channels || [];
     const hf = config.huggingface?.channels || [];
     const policy = getTieringPolicy(context.env, r2);
-    const incomingBytes = Math.ceil(await estimateIncomingBytes(request, new URL(request.url)));
+    const incomingBytes = Math.ceil(await estimateIncomingBytes(context, request, new URL(request.url)));
     if (context.env.img_r2 && r2.length) {
         const reservation = await reserveR2(context.env.img_r2, incomingBytes,
             policy.limitBytes * policy.threshold / 100,
@@ -133,7 +123,7 @@ export function shouldScheduleTelegramBackup(primaryChannel, url) {
 
 async function readPrimaryChannelFromChunkSession(context, request) {
     try {
-        const formdata = await request.clone().formData();
+        const formdata = await getUploadForm(context, request);
         const uploadId = formdata.get('uploadId');
         if (!uploadId) return '';
 

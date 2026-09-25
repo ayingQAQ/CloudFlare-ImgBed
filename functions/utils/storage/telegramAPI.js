@@ -1,3 +1,4 @@
+import { fetchUpstream } from '../upstreamFetch.js';
 /**
  * Telegram API 封装类
  */
@@ -22,7 +23,7 @@ export class TelegramAPI {
      * @param {string} functionType - 文件类型参数名（如：photo, document等）
      * @returns {Promise<Object>} API响应结果
      */
-    async sendFile(file, chatId, functionName, functionType, caption = '', fileName = '') {
+    async sendFile(file, chatId, functionName, functionType, caption = '', fileName = '', { signal } = {}) {
         const formData = new FormData();
 
         formData.append('chat_id', chatId);
@@ -38,7 +39,8 @@ export class TelegramAPI {
         const response = await fetch(`${this.baseURL}/${functionName}`, {
             method: 'POST',
             headers: this.defaultHeaders,
-            body: formData
+            body: formData,
+            signal
         });
         console.log('Telegram API response:', response.status, response.statusText);
         if (!response.ok) {
@@ -100,12 +102,13 @@ export class TelegramAPI {
      * @param {string} fileId - 文件ID
      * @returns {Promise<string|null>} 文件路径或null
      */
-    async getFilePath(fileId) {
+    async getFilePath(fileId, options = {}) {
         try {
             const url = `${this.baseURL}/getFile?file_id=${fileId}`;
-            const response = await fetch(url, {
+            const response = await fetchUpstream(url, {
                 method: 'GET',
                 headers: this.defaultHeaders,
+                signal: options.signal,
             });
 
             const responseData = await response.json();
@@ -115,6 +118,7 @@ export class TelegramAPI {
                 return null;
             }
         } catch (error) {
+            options.signal?.throwIfAborted();
             console.error('Error getting file path:', error.message);
             return null;
         }
@@ -125,15 +129,16 @@ export class TelegramAPI {
      * @param {string} fileId - 文件ID
      * @returns {Promise<Response>} 文件响应
      */
-    async getFileContent(fileId) {
-        const filePath = await this.getFilePath(fileId);
+    async getFileContent(fileId, options = {}) {
+        const filePath = await this.getFilePath(fileId, options);
         if (!filePath) {
             throw new Error(`File path not found for fileId: ${fileId}`);
         }
 
         const fullURL = `${this.fileDomain}/file/bot${this.botToken}/${filePath}`;
-        const response = await fetch(fullURL, {
-            headers: this.defaultHeaders
+        const response = await fetchUpstream(fullURL, {
+            headers: this.defaultHeaders,
+            signal: options.signal
         });
 
         return response;

@@ -1,7 +1,7 @@
 import { changeDirectories } from '../../../utils/directories.js';
 import { relocateTelegramBackup } from '../../../utils/telegramBackup.js';
 import { purgeCFCache, purgeRandomFileListCache, purgePublicFileListCache } from "../../../utils/purgeCache";
-import { moveFileInIndex, batchMoveFilesInIndex } from "../../../utils/indexManager.js";
+import { moveFileInIndex, batchMoveFilesInIndex, rebuildIndex } from "../../../utils/indexManager.js";
 import { getDatabase } from '../../../utils/databaseAdapter.js';
 import { sanitizeUploadFolder } from "../../../upload/uploadTools.js";
 import { cleanPersistedMetadata } from "../../../utils/metadata/metadataSecurity.js";
@@ -84,12 +84,13 @@ export async function onRequest(context) {
 
             // 批量从索引中删除文件，添加新文件
             if (processedFiles.length > 0) {
-                await batchMoveFilesInIndex(context, processedFiles.map(file => {
+                const indexResult = await batchMoveFilesInIndex(context, processedFiles.map(file => {
                     return {
                         originalFileId: file.fileId,
                         newFileId: file.newFileId,
                     };
                 }));
+                if (!indexResult.success) return indexFailure(context, processedFiles);
             }
 
             // 返回处理结果
@@ -124,7 +125,8 @@ export async function onRequest(context) {
             throw new Error('Move file failed');
         } else {
             // 从索引中删除旧文件，并添加新文件
-            await moveFileInIndex(context, fileId, newFileId);
+            const indexResult = await moveFileInIndex(context, fileId, newFileId);
+            if (!indexResult.success) return indexFailure(context, [{ fileId, newFileId }]);
         }
 
         return new Response(JSON.stringify({
@@ -209,4 +211,11 @@ export async function moveFile(env, fileId, newFileId, cdnUrl, url) {
         console.error('Move file failed:', e);
         return false;
     }
+}
+
+function indexFailure(context, processed) {
+    // Storage already moved; never report full success or invite a destructive retry.
+    context.waitUntil(rebuildIndex(context));
+    return Response.json({ success: false, error: 'Files moved but index update failed; index recovery scheduled',
+        code: 'MOVE_INDEX_PENDING', processed, requiresRefresh: true }, { status: 503 });
 }

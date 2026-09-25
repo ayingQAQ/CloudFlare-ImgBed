@@ -1,3 +1,5 @@
+export { HFCommitCoordinator } from '../../functions/utils/storage/hfCommitCoordinator.js';
+
 function unauthorized() {
     return new Response('Unauthorized', { status: 401, headers: { 'cache-control': 'no-store' } });
 }
@@ -25,10 +27,48 @@ async function handleD1(request, env) {
 async function handleBackup(env) {
     const tables = ['files', 'settings', 'index_operations', 'index_metadata', 'other_data'];
     const snapshot = { format: 'imgbed-d1-json-v1', createdAt: new Date().toISOString(), tables: {} };
+    const maxRows = 10_000;
+    const configuredBytes = Number(env.BACKUP_JSON_MAX_BYTES);
+    const maxBytes = Number.isSafeInteger(configuredBytes) && configuredBytes > 0
+        ? Math.min(configuredBytes, 64 * 1024 * 1024) : 16 * 1024 * 1024;
+    const quoteName = value => `"${value.replaceAll('"', '""')}"`;
+    const quoteText = value => `'${value.replaceAll("'", "''")}'`;
+    // Only schema metadata is read outside the snapshot transaction. Include
+    // every deployed column in the byte budget, including later migrations.
+    const columns = await Promise.all(tables.map(async table => {
+        const result = await env.img_d1.prepare(`PRAGMA table_info(${table})`).all();
+        const names = result.results.map(column => column.name);
+        if (!names.length) throw new Error(`Backup table missing: ${table}`);
+        return names;
+    }));
+    const schemaChecks = tables.map((table, index) =>
+        `(SELECT group_concat(name, char(31)) FROM pragma_table_info('${table}')) = ${quoteText(columns[index].join('\x1f'))}`);
+    const estimates = tables.map((table, index) => {
+        // JSON escaping takes at most six bytes per source byte. Per-column
+        // overhead also covers property names, nulls, numbers and separators.
+        // Compute lengths in SQL; never hydrate the potentially oversized rows.
+        const sizes = columns[index].map(column =>
+            `(6 * COALESCE(length(CAST(${quoteName(column)} AS BLOB)), 0) + ${6 * new TextEncoder().encode(column).byteLength + 24})`).join(' + ');
+        return `SELECT COUNT(*) AS row_count, COALESCE(SUM(${sizes}), 0) AS byte_count FROM (SELECT ${columns[index].map(quoteName).join(', ')} FROM ${table} LIMIT ${maxRows + 1})`;
+    });
+    const admission = `WITH backup_totals AS (
+        SELECT SUM(row_count) AS row_count, SUM(byte_count) AS byte_count FROM (${estimates.join(' UNION ALL ')})
+    ), backup_gate AS (
+        SELECT row_count, byte_count, (${schemaChecks.join(' AND ')}) AS schema_ok,
+            CASE WHEN (${schemaChecks.join(' AND ')}) AND row_count <= ${maxRows} AND byte_count <= ${maxBytes} THEN 1 ELSE 0 END AS admitted
+        FROM backup_totals
+    )`;
     // D1 batch executes in one transaction so related tables cannot be captured
-    // on opposite sides of a concurrent move/upload.
-    const results = await env.img_d1.batch(tables.map(table => env.img_d1.prepare(`SELECT * FROM ${table}`)));
-    tables.forEach((table, index) => { snapshot.tables[table] = results[index].results || []; });
+    // on opposite sides of a concurrent move/upload. Every SELECT checks the
+    // same snapshot budget, so an oversized database returns zero payload rows.
+    const statements = [env.img_d1.prepare(`${admission} SELECT * FROM backup_gate`),
+        ...tables.map((table, index) => env.img_d1.prepare(`${admission} SELECT ${columns[index].map(quoteName).join(', ')} FROM ${table} WHERE (SELECT admitted FROM backup_gate) = 1`))];
+    const results = await env.img_d1.batch(statements);
+    const gate = results[0]?.results?.[0];
+    if (!gate) throw new Error('Backup admission result missing');
+    if (!gate.schema_ok) return json({ error: 'Database schema changed during backup; retry the export.' }, 409);
+    if (!gate.admitted) return json({ error: 'Database exceeds the bounded inline backup budget. Use native D1 export for a complete database snapshot.', maxRows, maxBytes }, 413);
+    tables.forEach((table, index) => { snapshot.tables[table] = results[index + 1].results || []; });
     return json(snapshot);
 }
 
@@ -116,6 +156,12 @@ export default {
         }
         try {
             const url = new URL(request.url);
+            if (url.pathname === '/hf/commit' && request.method === 'POST') {
+                const body = await request.json();
+                if (!/^[\w.-]+\/[\w.-]+$/.test(body.repo || '')) return json({ error: 'Invalid repo' }, 400);
+                const id = env.HF_COMMITS.idFromName(body.repo);
+                return env.HF_COMMITS.get(id).fetch('https://hf-commit/submit', { method: 'POST', body: JSON.stringify(body) });
+            }
             if (url.pathname === '/backup' && request.method === 'GET') return await handleBackup(env);
             if (url.pathname === '/d1' && request.method === 'POST') return await handleD1(request, env);
             if (url.pathname.startsWith('/r2/')) return await handleR2(request, env, url);

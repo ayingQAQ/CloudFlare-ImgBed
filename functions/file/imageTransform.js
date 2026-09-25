@@ -198,7 +198,8 @@ export async function transformImageResponse(context, response) {
             response.body,
             imageTransform.options,
             sourceType,
-            outputFormat
+            outputFormat,
+            context.request.signal
         );
         if (fallbackResponse && !transformed.ok) {
             return fallbackResponse;
@@ -227,7 +228,7 @@ export async function transformImageResponse(context, response) {
     }
 }
 
-async function runImageTransform(env, stream, options, sourceType, outputFormat) {
+async function runImageTransform(env, stream, options, sourceType, outputFormat, signal) {
     const images = env?.IMAGES;
     if (images && typeof images.input === 'function') {
         const output = await images
@@ -246,6 +247,7 @@ async function runImageTransform(env, stream, options, sourceType, outputFormat)
             ...options,
             sourceType,
             outputFormat,
+            signal,
         });
     }
 

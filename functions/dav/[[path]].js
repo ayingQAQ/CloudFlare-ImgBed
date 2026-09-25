@@ -1,9 +1,13 @@
+import { limitUploadBody } from '../upload/uploadRequest.js';
+import { storageTiering } from '../upload/_middleware.js';
+import { onRequest as uploadFile } from '../upload/index.js';
 // WebDAV 服务支持
-import { fetchOthersConfig } from "../utils/sysConfig";
+import { fetchOthersConfig, bindRequestConfig } from "../utils/sysConfig";
 import { getDatabase } from "../utils/databaseAdapter";
 import { createApiToken } from "../api/manage/apiTokens";
 
 export async function onRequest(context) {
+    bindRequestConfig(context);
     const { request, env } = context;
 
     // WebDAV 规范：如果请求的是根目录 /dav 但没有斜杠，重定向到 /dav/，以保证客户端的 href 匹配
@@ -13,7 +17,7 @@ export async function onRequest(context) {
         return Response.redirect(url.toString(), 301);
     }
 
-    const authResponse = await checkAuth(request, env);
+    const authResponse = await checkAuth(request, env, context);
     if (authResponse) return authResponse;
 
     // 从请求路径中替换第一个 /dav 部分
@@ -23,7 +27,7 @@ export async function onRequest(context) {
     switch (modifiedRequest.method) {
         case 'OPTIONS': return handleOptions(modifiedRequest);
         case 'PROPFIND': return handlePropfind(modifiedRequest, env);
-        case 'PUT': return handlePut(modifiedRequest, env);
+        case 'PUT': return handlePut(modifiedRequest, env, context);
         case 'DELETE': return handleDelete(modifiedRequest, env);
         case 'GET': return handleGet(modifiedRequest, env);
         case 'MOVE': return handleMove(modifiedRequest, env, context);
@@ -34,8 +38,8 @@ export async function onRequest(context) {
 
 // --- UTILITY FUNCTIONS ---
 
-async function getApiHeaders(env) {
-    const othersConfig = await fetchOthersConfig(env);
+async function getApiHeaders(env, context) {
+    const othersConfig = await fetchOthersConfig(env, context);
     let token = othersConfig.webDAV.internalToken;
     let tokenId = othersConfig.webDAV.internalTokenId;
 
@@ -81,8 +85,8 @@ async function getApiHeaders(env) {
     };
 }
 
-async function checkAuth(request, env) {
-    const othersConfig = await fetchOthersConfig(env);
+async function checkAuth(request, env, context) {
+    const othersConfig = await fetchOthersConfig(env, context);
 
     const enabled = othersConfig.webDAV.enabled;
     if (!enabled) return new Response('WebDAV is disabled', { status: 403 }); // WebDAV disabled
@@ -159,7 +163,7 @@ async function handleGet(request, env) {
     }
 }
 
-async function handlePut(request, env) {
+async function handlePut(request, env, context) {
     const fullPath = decodeURIComponent(new URL(request.url).pathname.substring(1));
     if (!fullPath || fullPath.endsWith('/')) {
         return new Response('Invalid file name', { status: 400 });
@@ -183,9 +187,6 @@ async function handlePut(request, env) {
             .replace(/\/+$/, '');
     }
     
-    const fileContent = await request.blob();
-    const formData = new FormData();
-    formData.append('file', fileContent, fileName);
 
     const uploadUrl = new URL(`/upload`, request.url);
     uploadUrl.searchParams.set('uploadNameType', 'origin'); // WebDAV 规范：使用原始文件名
@@ -194,7 +195,7 @@ async function handlePut(request, env) {
     }
 
     // 获取 WebDAV 配置的上传渠道
-    const othersConfig = await fetchOthersConfig(env);
+    const othersConfig = await fetchOthersConfig(env, context);
     const webdavConfig = othersConfig.webDAV || {};
     if (webdavConfig.uploadChannel) {
         uploadUrl.searchParams.set('uploadChannel', webdavConfig.uploadChannel);
@@ -204,11 +205,23 @@ async function handlePut(request, env) {
     }
 
     try {
-        const response = await fetch(uploadUrl.toString(), { 
-            method: 'POST', 
-            body: formData,
-            headers: await getApiHeaders(env)
-        });
+        const apiHeaders = await getApiHeaders(env, context);
+        // Parse the raw DAV body exactly once, enforcing actual transport bytes
+        // before allocation. Share the File with the normal upload pipeline.
+        const fileContent = await new Response(limitUploadBody(request), {
+            headers: { 'Content-Type': request.headers.get('Content-Type') || 'application/octet-stream' },
+        }).blob();
+        const formData = new FormData();
+        formData.append('file', fileContent, fileName);
+        const headers = new Headers(request.headers);
+        headers.delete('Content-Length');
+        headers.delete('Content-Type');
+        headers.set('Authorization', apiHeaders.Authorization);
+        const uploadRequest = new Request(uploadUrl, { method: 'POST', headers, signal: request.signal });
+        const uploadContext = { ...context, request: uploadRequest,
+            data: { ...context.data, uploadForm: Promise.resolve(formData) } };
+        uploadContext.next = forwarded => uploadFile({ ...uploadContext, request: forwarded });
+        const response = await storageTiering(uploadContext);
         const result = await response.json(); 
         if (response.ok && Array.isArray(result) && result.length > 0 && result[0].src) {
             return new Response(null, { status: 201 }); // Created
@@ -218,8 +231,8 @@ async function handlePut(request, env) {
             return new Response(`Upload failed: ${errorMsg}`, { status: 500 });
         }
     } catch (error) {
-        console.error('Fetch to upload API failed:', error.stack);
-        return new Response('Failed to contact upload service', { status: 502 });
+        if (error.status !== 413) console.error('WebDAV upload failed:', error.stack);
+        return new Response(error.status === 413 ? error.message : 'Failed to process upload', { status: error.status || 502 });
     }
 }
 

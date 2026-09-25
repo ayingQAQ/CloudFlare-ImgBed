@@ -2,32 +2,138 @@
  * D1 数据库操作工具类
  */
 
+import { queryFilePage } from './d1FileQuery.js';
+
+const schemas = new WeakMap();
+const nowSeconds = () => Math.floor(Date.now() / 1000);
+const expiration = options => options.expiration != null ? Number(options.expiration)
+    : options.expirationTtl != null ? nowSeconds() + Number(options.expirationTtl) : null;
+
+// Old installations can upgrade lazily; cache only successful schema checks per binding.
+async function ensureColumns(db, table) {
+    let state = schemas.get(db);
+    if (!state) schemas.set(db, state = new Map());
+    if (!state.has(table)) state.set(table, (async () => {
+        const columns = new Set((await db.prepare(`PRAGMA table_info(${table})`).all()).results.map(c => c.name));
+        for (const [name, type] of [['expires_at', 'INTEGER'], ...(table === 'files' ? [['tags', 'TEXT']] : [])]) {
+            if (!columns.has(name)) {
+                try { await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`).run(); }
+                catch (error) {
+                    // A second isolate may have completed the same migration.
+                    const latest = await db.prepare(`PRAGMA table_info(${table})`).all();
+                    if (!latest.results.some(c => c.name === name)) throw error;
+                }
+            }
+        }
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_${table}_expires_at ON ${table}(expires_at)`).run();
+        if (table === 'files') await db.prepare('CREATE INDEX IF NOT EXISTS idx_files_page ON files(timestamp DESC, id ASC)').run();
+    })().catch(error => { state.delete(table); throw error; }));
+    return state.get(table);
+}
+
+async function listPage(db, table, key, options) {
+    await ensureColumns(db, table);
+    const limit = Math.min(1000, Math.max(1, Number(options.limit) || 1000));
+    const prefix = options.prefix || '';
+    const fields = table === 'files' ? 'id, metadata' : 'key, value';
+    const where = ['(expires_at IS NULL OR expires_at > ?)'];
+    const params = [nowSeconds()];
+    if (prefix) {
+        const characters = Array.from(prefix);
+        while (characters.length && characters.at(-1).codePointAt(0) === 0x10ffff) characters.pop();
+        const upper = characters.length ? characters.slice(0, -1).join('') + String.fromCodePoint(characters.at(-1).codePointAt(0) + 1) : null;
+        where.push(`${key} >= ?`); params.push(prefix);
+        if (upper) { where.push(`${key} < ?`); params.push(upper); }
+    }
+    if (options.cursor) { where.push(`${key} > ?`); params.push(options.cursor); }
+    const { results } = await db.prepare(`SELECT ${fields} FROM ${table} WHERE ${where.join(' AND ')} ORDER BY ${key} LIMIT ?`)
+        .bind(...params, limit + 1).all();
+    const more = results.length > limit;
+    const keys = results.slice(0, limit).map(row => table === 'files'
+        ? { name: row.id, metadata: JSON.parse(row.metadata || '{}') }
+        : { name: row.key, value: row.value });
+    return { keys, list_complete: !more, cursor: more ? keys.at(-1).name : null };
+}
+
 class D1Database {
     constructor(db) {
         this.db = db;
     }
 }
 
+D1Database.prototype.cleanupExpired = async function({ limit = 100 } = {}) {
+    let remaining = Math.min(1000, Math.max(1, Number(limit) || 100));
+    let deleted = 0;
+    for (const [table, key] of [['files', 'id'], ['settings', 'key']]) {
+        if (!remaining) break;
+        await ensureColumns(this.db, table);
+        // Abort metadata must outlive the provider upload. Only recovery maintenance
+        // may remove multipart markers; retain the session needed to select a provider.
+        const recoveryGuard = table === 'files' ? `
+            AND substr(id,1,10) <> 'multipart_'
+            AND (substr(id,1,15) <> 'upload_session_' OR NOT EXISTS (
+                SELECT 1 FROM files recovery WHERE recovery.id = 'multipart_' || substr(files.id,16)
+            ))` : '';
+        const result = await this.db.prepare(`DELETE FROM ${table} WHERE ${key} IN (SELECT ${key} FROM ${table} WHERE expires_at <= ? ${recoveryGuard} ORDER BY expires_at LIMIT ?)`)
+            .bind(nowSeconds(), remaining).run();
+        deleted += result.meta.changes;
+        remaining -= result.meta.changes;
+    }
+    return { deleted };
+};
+
+// Maintenance-only reader intentionally bypasses TTL visibility. Ordinary get/list
+// still hide expired sessions, while recovery can abort with the original identifiers.
+D1Database.prototype.listExpiredMultipart = async function({ limit = 20, cursor = '' } = {}) {
+    await ensureColumns(this.db, 'files');
+    const pageSize = Math.min(1000, Math.max(1, Math.floor(Number(limit) || 20)));
+    const time = nowSeconds();
+    const { results } = await this.db.prepare(`
+        SELECT multipart.id, multipart.value, session.value AS sessionValue
+        FROM files multipart
+        LEFT JOIN files session ON session.id = 'upload_session_' || substr(multipart.id,11)
+        WHERE multipart.id >= 'multipart_' AND multipart.id < ('multipart' || char(96))
+          AND multipart.id > ?
+          AND (multipart.expires_at <= ? OR (
+              multipart.expires_at IS NULL AND (
+                  session.expires_at <= ? OR
+                  CASE WHEN json_valid(session.value) THEN json_extract(session.value,'$.expiresAt') END <= ?
+              )
+          ))
+        ORDER BY multipart.id LIMIT ?
+    `).bind(cursor || '', time, time, time * 1000, pageSize + 1).all();
+    const more = results.length > pageSize;
+    const keys = results.slice(0,pageSize).map(row => ({ ...row, name: row.id }));
+    return { keys, cursor: more ? keys.at(-1).id : null, list_complete: !more };
+};
+
+D1Database.prototype.queryFiles = async function(options) {
+    await ensureColumns(this.db, 'files');
+    return queryFilePage(this.db, options);
+};
+
 // ==================== 文件操作 ====================
 
 /**
  * 保存文件记录 (替代 KV.put)
  */
-D1Database.prototype.putFile = function(fileId, value, options) {
+D1Database.prototype.putFile = async function(fileId, value, options) {
+    await ensureColumns(this.db, "files");
     value = value || '';
     options = options || {};
     var metadata = options.metadata || {};
     
     // 从metadata中提取字段用于索引
     var extractedFields = this.extractMetadataFields(metadata);
+    extractedFields.directory = metadata.Directory || fileId.slice(0, fileId.lastIndexOf("/") + 1);
     
     var stmt = this.db.prepare(
         'INSERT OR REPLACE INTO files (' +
         'id, value, metadata, file_name, file_type, file_size, ' +
         'upload_ip, upload_address, list_type, timestamp, ' +
         'label, directory, channel, channel_name, ' +
-        'tg_file_id, tg_chat_id, tg_bot_token, is_chunked' +
-        ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        'tg_file_id, tg_chat_id, tg_bot_token, is_chunked, tags, expires_at' +
+        ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     );
     
     return stmt.bind(
@@ -48,17 +154,20 @@ D1Database.prototype.putFile = function(fileId, value, options) {
         extractedFields.tgFileId,
         extractedFields.tgChatId,
         extractedFields.tgBotToken,
-        extractedFields.isChunked
+        extractedFields.isChunked,
+        JSON.stringify(metadata.Tags || []),
+        expiration(options)
     ).run();
 };
 
 /**
  * 获取文件记录 (替代 KV.get)
  */
-D1Database.prototype.getFile = function(fileId) {
+D1Database.prototype.getFile = async function(fileId) {
+    await ensureColumns(this.db, "files");
     var self = this;
-    var stmt = this.db.prepare('SELECT * FROM files WHERE id = ?');
-    return stmt.bind(fileId).first().then(function(result) {
+    var stmt = this.db.prepare('SELECT * FROM files WHERE id = ? AND (expires_at IS NULL OR expires_at > ?)');
+    return stmt.bind(fileId, nowSeconds()).first().then(function(result) {
         if (!result) return null;
         
         return {
@@ -86,53 +195,8 @@ D1Database.prototype.deleteFile = function(fileId) {
 /**
  * 列出文件 (替代 KV.list)
  */
-D1Database.prototype.listFiles = function(options) {
-    options = options || {};
-    var prefix = options.prefix || '';
-    var limit = options.limit || 1000;
-    var cursor = options.cursor || null;
-    
-    var query = 'SELECT id, metadata FROM files';
-    var params = [];
-    
-    if (prefix) {
-        query += ' WHERE id LIKE ?';
-        params.push(prefix + '%');
-    }
-    
-    if (cursor) {
-        query += prefix ? ' AND' : ' WHERE';
-        query += ' id > ?';
-        params.push(cursor);
-    }
-    
-    query += ' ORDER BY id LIMIT ?';
-    params.push(limit + 1);
-    
-    var stmt = this.db.prepare(query);
-    if (params.length > 0) {
-        stmt = stmt.bind.apply(stmt, params);
-    }
-    return stmt.all().then(function(response) {
-        var results = response.results || [];
-        var hasMore = results.length > limit;
-        if (hasMore) {
-            results.pop();
-        }
-
-        var keys = results.map(function(row) {
-            return {
-                name: row.id,
-                metadata: JSON.parse(row.metadata || '{}')
-            };
-        });
-        
-        return {
-            keys: keys,
-            cursor: hasMore && keys.length > 0 ? keys[keys.length - 1].name : null,
-            list_complete: !hasMore
-        };
-    });
+D1Database.prototype.listFiles = function(options = {}) {
+    return listPage(this.db, 'files', 'id', options);
 };
 
 // ==================== 设置操作 ====================
@@ -140,26 +204,17 @@ D1Database.prototype.listFiles = function(options) {
 /**
  * 保存设置 (替代 KV.put)
  */
-D1Database.prototype.putSetting = function(key, value, category) {
-    if (!category && key.startsWith('manage@sysConfig@')) {
-        category = key.split('@')[2];
-    }
-    
-    var stmt = this.db.prepare(
-        'INSERT OR REPLACE INTO settings (key, value, category) VALUES (?, ?, ?)'
-    );
-    
-    return stmt.bind(key, value, category).run();
+D1Database.prototype.putSetting = async function(key, value, category, options = {}) {
+    await ensureColumns(this.db, 'settings');
+    return this.db.prepare('INSERT OR REPLACE INTO settings (key, value, category, expires_at) VALUES (?, ?, ?, ?)')
+        .bind(key, value, category || key.split('@')[1] || '', expiration(options)).run();
 };
 
-/**
- * 获取设置 (替代 KV.get)
- */
-D1Database.prototype.getSetting = function(key) {
-    var stmt = this.db.prepare('SELECT value FROM settings WHERE key = ?');
-    return stmt.bind(key).first().then(function(result) {
-        return result ? result.value : null;
-    });
+D1Database.prototype.getSetting = async function(key) {
+    await ensureColumns(this.db, 'settings');
+    const result = await this.db.prepare('SELECT value FROM settings WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)')
+        .bind(key, nowSeconds()).first();
+    return result ? result.value : null;
 };
 
 /**
@@ -173,37 +228,8 @@ D1Database.prototype.deleteSetting = function(key) {
 /**
  * 列出设置 (替代 KV.list)
  */
-D1Database.prototype.listSettings = function(options) {
-    options = options || {};
-    var prefix = options.prefix || '';
-    var limit = options.limit || 1000;
-    
-    var query = 'SELECT key, value FROM settings';
-    var params = [];
-    
-    if (prefix) {
-        query += ' WHERE key LIKE ?';
-        params.push(prefix + '%');
-    }
-    
-    query += ' ORDER BY key LIMIT ?';
-    params.push(limit);
-    
-    var stmt = this.db.prepare(query);
-    if (params.length > 0) {
-        stmt = stmt.bind.apply(stmt, params);
-    }
-    return stmt.all().then(function(response) {
-        var results = response.results || [];
-        var keys = results.map(function(row) {
-            return {
-                name: row.key,
-                value: row.value
-            };
-        });
-
-        return { keys: keys };
-    });
+D1Database.prototype.listSettings = function(options = {}) {
+    return listPage(this.db, 'settings', 'key', options);
 };
 
 // ==================== 索引操作 ====================
@@ -264,7 +290,12 @@ D1Database.prototype.listIndexOperations = function(options) {
         params.push(processed);
     }
     
-    query += ' ORDER BY timestamp LIMIT ?';
+    if (options.cursor) {
+        query += params.length ? ' AND' : ' WHERE';
+        query += ' id > ?';
+        params.push(options.cursor.replace('manage@index@operation_', ''));
+    }
+    query += ' ORDER BY id LIMIT ?';
     params.push(limit);
     
     var stmt = this.db.prepare(query);
@@ -325,7 +356,7 @@ D1Database.prototype.put = function(key, value, options) {
     } else if (key.startsWith('manage@')) {
         // 所有 manage@ 前缀的键统一存入 settings 表
         var category = key.split('@')[1] || '';
-        return this.putSetting(key, value, category);
+        return this.putSetting(key, value, category, options);
     } else {
         return this.putFile(key, value, options);
     }
@@ -389,13 +420,15 @@ D1Database.prototype.list = function(options) {
     var self = this;
 
     if (prefix.startsWith('manage@index@operation_')) {
-        return this.listIndexOperations(options).then(function(operations) {
-            var keys = operations.map(function(op) {
+        const limit = Math.min(1000, Math.max(1, Number(options.limit) || 1000));
+        return this.listIndexOperations({ ...options, limit: limit + 1 }).then(function(operations) {
+            const more = operations.length > limit;
+            var keys = operations.slice(0, limit).map(function(op) {
                 return {
                     name: 'manage@index@operation_' + op.id
                 };
             });
-            return { keys: keys };
+            return { keys, cursor: more ? keys.at(-1).name : null, list_complete: !more };
         });
     } else if (prefix.startsWith('manage@')) {
         return this.listSettings(options);
@@ -406,3 +439,12 @@ D1Database.prototype.list = function(options) {
 
 // 导出构造函数
 export { D1Database };
+
+// Atomic publication of immutable index snapshots (also supported by RemoteD1).
+D1Database.prototype.compareAndSwapSetting = async function(key, expected, value) {
+    const statement = expected === null
+        ? this.db.prepare('INSERT OR IGNORE INTO settings (key, value, category) VALUES (?, ?, ?)').bind(key, value, 'index')
+        : this.db.prepare('UPDATE settings SET value = ? WHERE key = ? AND value = ?').bind(value, key, expected);
+    const result = await statement.run();
+    return result.meta.changes === 1;
+};

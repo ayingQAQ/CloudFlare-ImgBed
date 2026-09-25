@@ -9,7 +9,7 @@ test('backup reads all metadata tables in one D1 transaction', async () => {
     let calls = 0;
     const response = await gateway.fetch(new Request('https://state.test/backup', { headers: { authorization: 'Bearer test-secret' } }), {
         GATEWAY_SECRET: 'test-secret',
-        img_d1: { prepare(sql) { return sql; }, async batch(statements) { calls++; assert.equal(statements.length, 5); return statements.map(() => ({ results: [] })); } },
+        img_d1: { prepare(sql) { return { sql, async all() { return { results: [{ name: 'key' }, { name: 'value' }] }; } }; }, async batch(statements) { calls++; assert.equal(statements.length, 6); return [{ results: [{ admitted: 1, schema_ok: 1 }] }, ...statements.slice(1).map(() => ({ results: [] }))]; } },
     });
     assert.equal(response.status, 200);
     assert.equal(Object.keys((await response.json()).tables).length, 5);
@@ -43,7 +43,7 @@ test('remote R2 preserves unicode keys, open ranges, bytes and conditional reads
 
 test('channel synchronization cannot overwrite administrator settings and avoids unchanged writes', async()=>{
     const records=new Map();let writes=0;
-    const db={prepare(sql){let params;return {bind(...p){params=p;return this;},async first(){return records.has(params[0])?{value:records.get(params[0])}:null;},async run(){writes++;records.set(params[0],params[1]);return {success:true};}};}};
+    const db={prepare(sql){let params;return {bind(...p){params=p;return this;},async first(){return records.has(params[0])?{value:records.get(params[0])}:null;},async all(){assert.match(sql,/^PRAGMA table_info/);return {results:[{name:'expires_at'}]};},async run(){if(sql.startsWith('CREATE INDEX'))return {success:true};writes++;records.set(params[0],params[1]);return {success:true};}};}};
     const env={img_d1:db,ORIGIN_STATE_READY:'true',HF_TOKEN:'hf-test',TG_BOT_TOKEN:'tg-test',BASIC_PASS:'must-not-copy'};
     await syncOriginChannels(env);
     assert.equal(records.size,1);const value=records.get(ORIGIN_CHANNEL_KEY);

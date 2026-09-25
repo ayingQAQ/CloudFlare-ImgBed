@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS files (
     tg_chat_id TEXT,
     tg_bot_token TEXT,
     is_chunked BOOLEAN DEFAULT FALSE,
-    tags TEXT, 
+    tags TEXT,
+    expires_at INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     category TEXT,
+    expires_at INTEGER,
     description TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP

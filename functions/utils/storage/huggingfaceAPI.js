@@ -13,7 +13,8 @@
  */
 
 export class HuggingFaceAPI {
-    constructor(token, repo, isPrivate = false) {
+    constructor(token, repo, isPrivate = false, env = {}) {
+        this.env = env;
         this.token = token;
         this.repo = repo;  // 格式: username/repo-name
         this.isPrivate = isPrivate;
@@ -239,6 +240,11 @@ export class HuggingFaceAPI {
      * 步骤4: 提交 LFS 文件引用
      */
     async commitLfsFile(filePath, oid, fileSize, commitMessage) {
+        if (this.env.HF_COMMITS || this.env.STATE_GATEWAY_URL) {
+            return this.coordinatedCommit({ key: 'lfsFile', value: {
+                path: filePath, algo: 'sha256', size: fileSize, oid
+            } });
+        }
         const url = `${this.baseURL}/api/datasets/${this.repo}/commit/main`;
         
         // NDJSON 格式
@@ -284,6 +290,7 @@ export class HuggingFaceAPI {
      * @param {string} fileSample - 文件前512字节的 base64
      */
     async getLfsUploadInfo(fileSize, filePath, sha256, fileSample) {
+        if (this.env.HF_COMMITS || this.env.STATE_GATEWAY_URL) await this.coordinatedCommit(null);
         // 确保仓库存在
         if (!await this.createRepoIfNotExists()) {
             throw new Error('Failed to create or access repository');
@@ -341,6 +348,7 @@ export class HuggingFaceAPI {
      */
     async uploadFile(file, filePath, commitMessage = 'Upload file', precomputedSha256 = null) {
         try {
+            if (this.env.HF_COMMITS || this.env.STATE_GATEWAY_URL) await this.coordinatedCommit(null);
             // 确保仓库存在
             if (!await this.createRepoIfNotExists()) {
                 throw new Error('Failed to create or access repository');
@@ -423,6 +431,28 @@ export class HuggingFaceAPI {
     /**
      * 直接提交文件（非 LFS，用于小文本文件）
      */
+    async coordinatedCommit(operation) {
+        const body = JSON.stringify({ repo: this.repo, token: this.token, operation, check: operation === null });
+        let response;
+        if (this.env.HF_COMMITS) {
+            const id = this.env.HF_COMMITS.idFromName(this.repo);
+            response = await this.env.HF_COMMITS.get(id).fetch('https://hf-commit/submit', { method: 'POST', body });
+        } else {
+            if (!this.env.STATE_GATEWAY_SECRET) throw new Error('HF coordinator credentials missing');
+            response = await fetch(`${this.env.STATE_GATEWAY_URL.replace(/\/$/, '')}/hf/commit`, {
+                method: 'POST', body, signal: AbortSignal.timeout(90000),
+                headers: { Authorization: `Bearer ${this.env.STATE_GATEWAY_SECRET}`, 'Content-Type': 'application/json' }
+            });
+        }
+        if (!response.ok) {
+            const error = new Error(`Commit failed: ${response.status} - ${await response.text()}`);
+            error.status = response.status;
+            error.retryAfter = response.headers.get('Retry-After');
+            throw error;
+        }
+        return response.json();
+    }
+
     async commitDirectFile(filePath, file, commitMessage) {
         const url = `${this.baseURL}/api/datasets/${this.repo}/commit/main`;
         
@@ -439,6 +469,9 @@ export class HuggingFaceAPI {
             parts.push(s);
         }
         const content = btoa(parts.join(''));
+        if (this.env.HF_COMMITS || this.env.STATE_GATEWAY_URL) {
+            return this.coordinatedCommit({ key: 'file', value: { path: filePath, content, encoding: 'base64' } });
+        }
         
         const body = [
             JSON.stringify({

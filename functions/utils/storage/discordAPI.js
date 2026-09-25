@@ -1,3 +1,4 @@
+import { fetchUpstream, abortableDelay } from '../upstreamFetch.js';
 /**
  * Discord API 封装类
  * 用于上传文件到 Discord 频道并获取文件
@@ -19,7 +20,7 @@ export class DiscordAPI {
      * @param {string} fileName - 文件名
      * @returns {Promise<Object>} API 响应结果
      */
-    async sendFile(file, channelId, fileName = '') {
+    async sendFile(file, channelId, fileName = '', { signal } = {}) {
         const formData = new FormData();
         
         // Discord 使用 files[0] 作为文件字段名
@@ -32,7 +33,8 @@ export class DiscordAPI {
         const response = await fetch(`${this.baseURL}/channels/${channelId}/messages`, {
             method: 'POST',
             headers: this.defaultHeaders,
-            body: formData
+            body: formData,
+            signal
         });
 
         console.log('Discord API response:', response.status, response.statusText);
@@ -86,27 +88,31 @@ export class DiscordAPI {
      * @param {number} maxRetries - 最大重试次数（默认 3 次）
      * @returns {Promise<Object|null>} 消息数据或 null
      */
-    async getMessage(channelId, messageId, maxRetries = 3) {
+    async getMessage(channelId, messageId, maxRetries = 3, options = {}) {
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             try {
-                const response = await fetch(`${this.baseURL}/channels/${channelId}/messages/${messageId}`, {
+                const response = await fetchUpstream(`${this.baseURL}/channels/${channelId}/messages/${messageId}`, {
                     method: 'GET',
-                    headers: this.defaultHeaders
+                    headers: this.defaultHeaders,
+                    signal: options.signal
                 });
 
                 // 429 速率限制：等待后重试
                 if (response.status === 429) {
                     const retryAfter = response.headers.get('Retry-After');
-                    const waitTime = retryAfter ? parseFloat(retryAfter) * 1000 : 1000 * (attempt + 1);
+                    const parsedWait = Number(retryAfter) * 1000;
+                    const waitTime = Math.min(5000, Math.max(0, Number.isFinite(parsedWait) && parsedWait > 0 ? parsedWait : 1000 * (attempt + 1)));
+                    await response.body?.cancel();
                     console.warn(`Discord 429 rate limit, waiting ${waitTime}ms before retry ${attempt + 1}/${maxRetries}`);
                     
                     if (attempt < maxRetries) {
-                        await new Promise(resolve => setTimeout(resolve, waitTime));
+                        await abortableDelay(waitTime, options.signal);
                         continue;
                     }
                 }
 
                 if (!response.ok) {
+                    await response.body?.cancel();
                     console.error('Discord getMessage error:', response.status, response.statusText);
                     return null;
                 }
@@ -114,9 +120,10 @@ export class DiscordAPI {
                 const messageData = await response.json();
                 return messageData;
             } catch (error) {
+                options.signal?.throwIfAborted();
                 console.error('Error getting Discord message:', error.message);
                 if (attempt < maxRetries) {
-                    await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+                    await abortableDelay(500 * (attempt + 1), options.signal);
                     continue;
                 }
                 return null;
@@ -131,8 +138,8 @@ export class DiscordAPI {
      * @param {string} messageId - 消息 ID
      * @returns {Promise<string|null>} 文件 URL 或 null
      */
-    async getFileURL(channelId, messageId) {
-        const message = await this.getMessage(channelId, messageId);
+    async getFileURL(channelId, messageId, options = {}) {
+        const message = await this.getMessage(channelId, messageId, 3, options);
         
         if (message && message.attachments && message.attachments.length > 0) {
             return message.attachments[0].url;
@@ -147,14 +154,14 @@ export class DiscordAPI {
      * @param {string} messageId - 消息 ID
      * @returns {Promise<Response>} 文件响应
      */
-    async getFileContent(channelId, messageId) {
-        const fileURL = await this.getFileURL(channelId, messageId);
+    async getFileContent(channelId, messageId, options = {}) {
+        const fileURL = await this.getFileURL(channelId, messageId, options);
         
         if (!fileURL) {
             throw new Error(`File URL not found for messageId: ${messageId}`);
         }
 
-        const response = await fetch(fileURL);
+        const response = await fetchUpstream(fileURL, { signal: options.signal });
         return response;
     }
 

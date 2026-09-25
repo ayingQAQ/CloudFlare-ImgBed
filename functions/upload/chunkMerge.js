@@ -1,3 +1,6 @@
+import { finishMultipartRecovery } from '../utils/multipartRecovery.js';
+import { chargeR2Usage, releaseR2 } from '../utils/r2Capacity.js';
+import { getUploadForm } from './uploadRequest.js';
 /* ========== 分块合并处理 ========== */
 import { createResponse, getUploadIp, getIPAddress, selectConsistentChannel, buildUniqueFileId, endUpload, sanitizeUploadFolder } from './uploadTools';
 import { retryFailedChunks, cleanupFailedMultipartUploads, checkChunkUploadStatuses, cleanupChunkData, cleanupUploadSession } from './chunkUpload';
@@ -11,7 +14,7 @@ export async function handleChunkMerge(context) {
     const db = getDatabase(env);
 
     // 解析表单数据
-    const formdata = await request.formData();
+    const formdata = await getUploadForm(context);
     context.formdata = formdata;
 
     let uploadId, totalChunks, originalFileName, originalFileType, uploadChannel;
@@ -66,7 +69,17 @@ export async function handleChunkMerge(context) {
         console.log(`Initial chunk status summary: ${JSON.stringify(initialStatusSummary)}`);
 
         // 开始合并处理
-        return await startMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel);
+        const failedChunks = chunkStatuses.filter(chunk => ['failed', 'timeout'].includes(chunk.status) && chunk.hasData);
+        if (failedChunks.length) {
+            await retryFailedChunks(context, failedChunks, uploadChannel);
+            const retried = await checkChunkUploadStatuses(env, uploadId, totalChunks, failedChunks.map(chunk => chunk.index));
+            for (const chunk of retried) chunkStatuses[chunk.index] = chunk;
+        }
+        const incomplete = chunkStatuses.filter(chunk => chunk.status !== 'completed');
+        if (incomplete.length) return createResponse(JSON.stringify({ success: false, retryable: true,
+            error: 'chunks_incomplete', resendChunks: incomplete.map(chunk => chunk.index) }), {
+            status: 409, headers: { 'Content-Type': 'application/json' } });
+        return await startMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel, chunkStatuses);
 
     } catch (error) {
         // 清理失败的multipart uploads
@@ -85,7 +98,7 @@ export async function handleChunkMerge(context) {
 }
 
 // 开始合并处理
-async function startMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel) {
+async function startMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel, chunkStatuses) {
     const { env } = context;
 
     try {
@@ -104,7 +117,7 @@ async function startMerge(context, uploadId, totalChunks, originalFileName, orig
         console.log(`Merge status: ${JSON.stringify(mergeStatus)}`);
 
         // 同步执行合并
-        const result = await handleChannelBasedMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel);
+        const result = await handleChannelBasedMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel, chunkStatuses);
 
         if (result.success) {
             // 清理临时分块数据
@@ -117,7 +130,7 @@ async function startMerge(context, uploadId, totalChunks, originalFileName, orig
             if (result.result && result.result.length > 0) {
                 const src = result.result[0].src;
                 const fileName = src.startsWith('/file/') ? src.slice(6) : src.split('/file/').pop();
-                const pageConfig = await fetchPageConfig(env);
+                const pageConfig = await fetchPageConfig(env, context);
                 const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
                 const urlPrefix = urlPrefixConfig?.value || '';
                 if (urlPrefix) {
@@ -150,7 +163,7 @@ async function startMerge(context, uploadId, totalChunks, originalFileName, orig
 }
 
 // 基于渠道的合并处理
-async function handleChannelBasedMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel) {
+async function handleChannelBasedMerge(context, uploadId, totalChunks, originalFileName, originalFileType, uploadChannel, chunkStatuses) {
     const { request, env, url } = context;
 
     try {
@@ -174,48 +187,7 @@ async function handleChannelBasedMerge(context, uploadId, totalChunks, originalF
             Tags: []
         };
 
-        // 收集所有已上传的分块信息
-        const chunkStatuses = await checkChunkUploadStatuses(env, uploadId, totalChunks);
-        let completedChunks = chunkStatuses.filter(chunk => chunk.status === 'completed');
-        let uploadingChunks = chunkStatuses.filter(chunk =>
-            chunk.status === 'uploading' ||
-            chunk.status === 'retrying'
-        );
-        let failedChunks = chunkStatuses.filter(chunk =>
-            chunk.status === 'failed' ||
-            chunk.status === 'timeout'
-        );
-
-        // 统计不同状态的分块
-        const statusSummary = chunkStatuses.reduce((acc, chunk) => {
-            acc[chunk.status] = (acc[chunk.status] || 0) + 1;
-            return acc;
-        }, {});
-
-        console.log(`Chunk status summary: ${JSON.stringify(statusSummary)}`);
-
-        // 如果有失败的分块，尝试重试
-        if (failedChunks.length > 0) {
-            console.log(`Retrying ${failedChunks.length} failed chunks...`);
-            // 同步重试（await）
-            await retryFailedChunks(context, failedChunks, uploadChannel);
-        }
-
-        // 重新检查状态
-        const updatedStatuses = await checkChunkUploadStatuses(env, uploadId, totalChunks);
-        completedChunks = updatedStatuses.filter(chunk => chunk.status === 'completed');
-
-        // 最终检查是否所有分块都完成
-        if (completedChunks.length !== totalChunks) {
-            // 获取最新的状态信息
-            const finalStatuses = await checkChunkUploadStatuses(env, uploadId, totalChunks);
-            const finalStatusSummary = finalStatuses.reduce((acc, chunk) => {
-                acc[chunk.status] = (acc[chunk.status] || 0) + 1;
-                return acc;
-            }, {});
-
-            throw new Error(`Only ${completedChunks.length}/${totalChunks} chunks completed successfully. Final status: ${JSON.stringify(finalStatusSummary)}`);
-        }
+        const completedChunks = chunkStatuses;
 
         // 根据渠道合并分块信息
         let result;
@@ -272,7 +244,13 @@ async function mergeR2ChunksInfo(context, uploadId, completedChunks, metadata) {
 
         // 完成multipart upload
         const multipartUpload = R2DataBase.resumeMultipartUpload(multipartInfo.key, multipartInfo.uploadId);
+        const bypassReservation = !context.data?.r2Reservation
+            ? await chargeR2Usage(R2DataBase, completedChunks.reduce((sum, chunk) => sum + chunk.uploadResult.size, 0)) : null;
         await multipartUpload.complete(parts);
+        context.data ||= {};
+        context.data.r2ObjectCommitted = true;
+        await finishMultipartRecovery(env, uploadId);
+        if (bypassReservation) await releaseR2(R2DataBase, bypassReservation, { committed: true });
 
         // 计算总大小
         const totalSize = completedChunks.reduce((sum, chunk) => sum + chunk.uploadResult.size, 0);
@@ -381,6 +359,7 @@ async function mergeS3ChunksInfo(context, uploadId, completedChunks, metadata) {
             UploadId: multipartInfo.uploadId,
             MultipartUpload: { Parts: parts }
         }));
+        await finishMultipartRecovery(env, uploadId);
 
         // 计算总大小
         const totalSize = completedChunks.reduce((sum, chunk) => sum + chunk.uploadResult.size, 0);

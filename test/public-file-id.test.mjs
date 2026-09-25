@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { publicFileId, relocatePublicFile, resolvePublicFile } from '../functions/utils/publicFileId.js';
+import { publicFileId, relocatePublicFile, resolvePublicFile, backfillPublicFileAliases } from '../functions/utils/publicFileId.js';
 
 test('opaque links hide directories, preserve extension and distinguish same filenames', async () => {
     const alias = await publicFileId('照片/旅行/0013.jpg');
@@ -9,13 +9,15 @@ test('opaque links hide directories, preserve extension and distinguish same fil
     assert.equal(await publicFileId(alias), alias);
 });
 
-test('old files resolve without redirects; subsequent lookups use their saved mapping', async () => {
+test('old files resolve after bounded maintenance backfills their saved mapping', async () => {
     const records = new Map();
-    const env = { img_url: { get: async k => records.get(k), put: async (k, v) => records.set(k, v) } };
+    const env = { img_url: { get: async k => records.get(k), put: async (k, v) => records.set(k, v), list: async () => ({keys: [{name:'照片/旅行/0013.jpg',metadata:{TimeStamp:1}}],list_complete:true}) } };
     const id = '照片/旅行/0013.jpg';
     const alias = await publicFileId(id);
     assert.equal(await resolvePublicFile(env, id, () => { throw Error('legacy'); }), id);
-    assert.equal(await resolvePublicFile(env, alias, async () => [{ id }]), id);
+    assert.equal(await resolvePublicFile(env, alias, async () => { throw Error('unexpected scan'); }), null);
+    await backfillPublicFileAliases(env);
+    assert.equal(await resolvePublicFile(env, alias), id);
     assert.equal(await resolvePublicFile(env, alias, () => { throw Error('cached'); }), id);
     assert.equal(await resolvePublicFile(env, await publicFileId('missing'), async () => []), null);
 });

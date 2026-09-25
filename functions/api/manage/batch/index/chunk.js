@@ -326,6 +326,11 @@ export async function onRequestPost(context) {
 
     // 6. 获取数据库实例
     const db = getDatabase(env);
+    const metadataSnapshot = await db.get('manage@index@meta');
+    const startedAt = Number(/^rebuild_(\d+)_/.exec(sessionId)?.[1]);
+    if (startedAt && Number(JSON.parse(metadataSnapshot || '{}').lastUpdated || 0) >= startedAt) {
+      return errorResponse('Index changed since collection started; restart rebuild', 409);
+    }
 
     // 存储分块数据到 KV
     // 使用格式: chunk_{sessionId}_{chunkId}
@@ -338,9 +343,10 @@ export async function onRequestPost(context) {
       checksum: calculatedChecksum,
       storedAt: Date.now(),
       recordCount: sanitizedData.length,
+      metadataSnapshot,
     };
 
-    await db.put(chunkKey, JSON.stringify(chunkData));
+    await db.put(chunkKey, JSON.stringify(chunkData), { expirationTtl: 86400 });
 
     // 8. 返回成功响应
     return jsonResponse({

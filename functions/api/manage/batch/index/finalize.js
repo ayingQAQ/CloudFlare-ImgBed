@@ -6,7 +6,8 @@
  * 清理临时分块数据
  */
 
-import { getDatabase, checkDatabaseConfig } from '../../../../utils/databaseAdapter.js';
+import { getDatabase } from '../../../../utils/databaseAdapter.js';
+import { saveChunkedIndex } from '../../../../utils/indexManager.js';
 
 // CORS 跨域响应头
 const corsHeaders = {
@@ -16,22 +17,7 @@ const corsHeaders = {
   'Access-Control-Max-Age': '86400',
 };
 
-// 索引存储键
-const INDEX_KEY = 'manage@index';
 const INDEX_META_KEY = 'manage@index@meta';
-// D1 单字段限制 2MB，KV 限制 25MB，根据数据库类型动态设置
-const INDEX_CHUNK_SIZE_D1 = 500; // D1 数据库分块大小
-const INDEX_CHUNK_SIZE_KV = 5000; // KV 存储分块大小
-
-/**
- * 根据数据库类型获取索引分块大小
- * @param {Object} env - 环境变量
- * @returns {number} 分块大小
- */
-function getIndexChunkSize(env) {
-  const config = checkDatabaseConfig(env);
-  return config.usingD1 ? INDEX_CHUNK_SIZE_D1 : INDEX_CHUNK_SIZE_KV;
-}
 
 /**
  * 创建 JSON 响应
@@ -154,6 +140,7 @@ async function readAllChunks(db, sessionId, totalChunks) {
         chunkId: parseInt(chunkData.chunkId, 10),
         data: chunkData.data,
         recordCount: chunkData.recordCount || chunkData.data.length,
+        metadataSnapshot: chunkData.metadataSnapshot,
       });
     } catch (error) {
       console.error(`Error reading chunk ${chunkId}:`, error);
@@ -197,66 +184,11 @@ function assembleChunks(chunks) {
  * @param {Object} env - 环境变量
  * @returns {Promise<{success: boolean, metadata?: Object, error?: string}>}
  */
-async function saveIndex(db, files, env) {
-  try {
-    const chunkSize = getIndexChunkSize(env);
-    const chunks = [];
-    
-    // 将文件数组分块
-    for (let i = 0; i < files.length; i += chunkSize) {
-      const chunk = files.slice(i, i + chunkSize);
-      chunks.push(chunk);
-    }
-
-    // 计算各渠道容量统计
-    const channelStats = {};
-    let totalSizeMB = 0;
-
-    for (const file of files) {
-      const channelName = file.metadata?.ChannelName;
-      const fileSize = parseFloat(file.metadata?.FileSize) || 0;
-
-      totalSizeMB += fileSize;
-
-      if (channelName) {
-        if (!channelStats[channelName]) {
-          channelStats[channelName] = { usedMB: 0, fileCount: 0 };
-        }
-        channelStats[channelName].usedMB += fileSize;
-        channelStats[channelName].fileCount += 1;
-      }
-    }
-
-    const lastUpdated = Date.now();
-
-    // 保存索引元数据
-    const metadata = {
-      lastUpdated,
-      totalCount: files.length,
-      totalSizeMB: Math.round(totalSizeMB * 100) / 100,
-      channelStats,
-      lastOperationId: null, // 重建后清除操作 ID
-      chunkCount: chunks.length,
-      chunkSize: chunkSize,
-    };
-
-    await db.put(INDEX_META_KEY, JSON.stringify(metadata));
-
-    // 保存各个分块
-    const savePromises = chunks.map((chunk, chunkId) => {
-      const chunkKey = `${INDEX_KEY}_${chunkId}`;
-      return db.put(chunkKey, JSON.stringify(chunk));
-    });
-
-    await Promise.all(savePromises);
-
-    console.log(`Saved index: ${chunks.length} chunks, ${files.length} total files, ${totalSizeMB.toFixed(2)} MB`);
-
-    return { success: true, metadata };
-  } catch (error) {
-    console.error('Error saving index:', error);
-    return { success: false, error: error.message };
-  }
+async function saveIndex(context, files, metadataSnapshot) {
+  files.sort((a, b) => (b.metadata?.TimeStamp || 0) - (a.metadata?.TimeStamp || 0) || a.id.localeCompare(b.id));
+  const index = { files, totalCount: files.length, lastUpdated: Date.now(), lastOperationId: null, metadataSnapshot };
+  const success = await saveChunkedIndex(context, index);
+  return { success, metadata: { lastUpdated: index.lastUpdated }, error: success ? null : 'Index publication failed or the baseline changed; retry rebuild' };
 }
 
 /**
@@ -267,55 +199,13 @@ async function saveIndex(db, files, env) {
  * @returns {Promise<void>}
  */
 async function cleanupChunks(db, sessionId, totalChunks) {
-  const deletePromises = [];
-
-  for (let chunkId = 0; chunkId < totalChunks; chunkId++) {
-    const chunkKey = `chunk_${sessionId}_${chunkId}`;
-    deletePromises.push(
-      db.delete(chunkKey).catch(error => {
-        console.warn(`Failed to delete chunk ${chunkKey}:`, error);
-      })
-    );
+  for (let first = 0; first < totalChunks; first += 8) {
+    await Promise.all(Array.from({ length: Math.min(8, totalChunks - first) }, (_, offset) => {
+      const key = `chunk_${sessionId}_${first + offset}`;
+      return db.delete(key).catch(error => console.warn(`Failed to delete chunk ${key}:`, error));
+    }));
   }
-
-  await Promise.all(deletePromises);
   console.log(`Cleaned up ${totalChunks} temporary chunks for session ${sessionId}`);
-}
-
-/**
- * 清理旧的索引分块（如果新索引分块数量少于旧的）
- * @param {Object} db - 数据库实例
- * @param {number} newChunkCount - 新索引的分块数量
- * @returns {Promise<void>}
- */
-async function cleanupOldIndexChunks(db, newChunkCount) {
-  try {
-    // 读取旧的元数据获取旧的分块数量
-    const oldMetaStr = await db.get(INDEX_META_KEY);
-    if (!oldMetaStr) {
-      return;
-    }
-
-    const oldMeta = JSON.parse(oldMetaStr);
-    const oldChunkCount = oldMeta.chunkCount || 0;
-
-    // 如果新的分块数量少于旧的，删除多余的分块
-    if (newChunkCount < oldChunkCount) {
-      const deletePromises = [];
-      for (let i = newChunkCount; i < oldChunkCount; i++) {
-        const chunkKey = `${INDEX_KEY}_${i}`;
-        deletePromises.push(
-          db.delete(chunkKey).catch(error => {
-            console.warn(`Failed to delete old index chunk ${chunkKey}:`, error);
-          })
-        );
-      }
-      await Promise.all(deletePromises);
-      console.log(`Cleaned up ${oldChunkCount - newChunkCount} old index chunks`);
-    }
-  } catch (error) {
-    console.warn('Error cleaning up old index chunks:', error);
-  }
 }
 
 /**
@@ -348,17 +238,20 @@ export async function onRequestPost(context) {
 
     // 4. 获取数据库实例
     const db = getDatabase(env);
+    const metadataSnapshot = await db.get(INDEX_META_KEY);
+    const startedAt = Number(/^rebuild_(\d+)_/.exec(sessionId)?.[1]);
+    if (startedAt && Number(JSON.parse(metadataSnapshot || '{}').lastUpdated || 0) >= startedAt) {
+      return errorResponse('Index changed since collection started; restart rebuild', 409);
+    }
 
     // 5. 处理空索引的情况
     if (totalChunks === 0 || totalFiles === 0) {
       // 保存空索引
-      const saveResult = await saveIndex(db, [], env);
+      const saveResult = await saveIndex(context, [], metadataSnapshot);
       if (!saveResult.success) {
         return errorResponse('Failed to save empty index', 500, saveResult.error);
       }
 
-      // 清理旧的索引分块
-      await cleanupOldIndexChunks(db, 0);
 
       return jsonResponse({
         success: true,
@@ -372,6 +265,9 @@ export async function onRequestPost(context) {
     if (!chunksResult.success) {
       return errorResponse('Failed to read chunks', 400, chunksResult.error);
     }
+    if (chunksResult.chunks.some(chunk => chunk.metadataSnapshot !== metadataSnapshot)) {
+      return errorResponse('Staged chunks have an outdated or missing baseline; restart rebuild', 409);
+    }
 
     // 7. 组装分块为完整索引
     const allFiles = assembleChunks(chunksResult.chunks);
@@ -379,16 +275,12 @@ export async function onRequestPost(context) {
     // 8. 验证文件数量
     if (allFiles.length !== totalFiles) {
       console.warn(`File count mismatch: expected ${totalFiles}, got ${allFiles.length}`);
-      // 不作为错误处理，继续保存实际获取的文件数量
+      return errorResponse('File count mismatch', 400);
     }
 
-    // 9. 清理旧的索引分块（在保存新索引之前）
-    const chunkSize = getIndexChunkSize(env);
-    const newChunkCount = Math.ceil(allFiles.length / chunkSize);
-    await cleanupOldIndexChunks(db, newChunkCount);
-
-    // 10. 保存新索引
-    const saveResult = await saveIndex(db, allFiles, env);
+    // Publish immutable chunks before conditionally advancing the active pointer.
+    // Pending operations remain available for replay after publication.
+    const saveResult = await saveIndex(context, allFiles, metadataSnapshot);
     if (!saveResult.success) {
       return errorResponse('Failed to save index', 500, saveResult.error);
     }

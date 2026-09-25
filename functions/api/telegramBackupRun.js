@@ -1,5 +1,6 @@
 import { userAuthCheck, UnauthorizedResponse } from '../utils/auth/userAuth.js';
 import { drainTelegramBackups, getTelegramBackup, processTelegramBackup } from '../utils/telegramBackup.js';
+import { runMaintenance } from '../utils/maintenance.js';
 
 async function equalSecret(actual, expected) {
     if (!actual || !expected) return false;
@@ -16,6 +17,7 @@ export async function onRequestPost(context) {
     if (!runner && (!fileId || !await userAuthCheck(env, url, request, 'upload'))) return UnauthorizedResponse('Unauthorized');
     if (!env.img_r2) return Response.json({ error: 'R2 binding is required' }, { status: 503 });
     if (!fileId) {
+        await runMaintenance(env);
         const processed = await drainTelegramBackups(env, 1);
         return Response.json({ success: true, processed }, { headers: { 'Cache-Control': 'no-store' } });
     }

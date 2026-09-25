@@ -165,8 +165,8 @@ export function checkDatabaseConfig(env) {
     return {
         hasD1: hasD1,
         hasKV: hasKV,
-        usingD1: hasD1,
-        usingKV: !hasD1 && hasKV,
+        usingD1: !hasKV && hasD1,
+        usingKV: hasKV,
         configured: hasD1 || hasKV
     };
 }

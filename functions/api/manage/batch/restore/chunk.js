@@ -1,3 +1,4 @@
+import { resetPublicFileAliasBackfill } from '../../../../utils/publicFileId.js';
 /**
  * BatchRestoreChunkAPI - 分批恢复数据的 API 端点
  * 
@@ -127,6 +128,8 @@ export async function onRequestPost(context) {
         }
       }
     }
+
+    await resetPublicFileAliasBackfill(env);
 
     return jsonResponse({
       success: true,

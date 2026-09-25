@@ -1,3 +1,5 @@
+import { runMaintenance } from '../../functions/utils/maintenance.js';
+import { createFunctionRouter } from './functionRouter.js';
 import { drainTelegramBackups } from '../../functions/utils/telegramBackup.js';
 /**
  * Docker 模式下的原生 Node.js 服务器
@@ -9,7 +11,7 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { getConnInfo } from '@hono/node-server/conninfo';
-import { existsSync, readFileSync, readdirSync, statSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, mkdirSync } from 'fs';
 import { join, resolve, dirname } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { SqliteD1 } from './sqliteD1.js';
@@ -20,6 +22,7 @@ import { publicFetch } from './public-fetch.js';
 import { RemoteR2Storage } from './remoteR2.js';
 import { ORIGIN_CHANNEL_KEY, ORIGIN_CHANNEL_FIELDS } from '../../functions/utils/originChannels.js';
 import { dockerImageProcessor } from './imageProcessor.js';
+import { LocalListCache } from './listCache.js';
 
 const NativeResponse = globalThis.Response;
 
@@ -28,11 +31,7 @@ const NativeResponse = globalThis.Response;
 // 模拟 Cloudflare Cache API（Node.js 中不存在）
 if (typeof globalThis.caches === 'undefined') {
     globalThis.caches = {
-        default: {
-            async match() { return undefined; },
-            async put() {},
-            async delete() { return false; },
-        },
+        default: new LocalListCache(),
     };
 }
 
@@ -79,7 +78,8 @@ globalThis.fetch = async function(input, init) {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = resolve(__dirname, '../..');
 const FUNCTIONS_DIR = resolve(ROOT_DIR, 'functions');
-const DATA_DIR = resolve(ROOT_DIR, 'data');
+const functionRouter = createFunctionRouter(FUNCTIONS_DIR);
+const DATA_DIR = resolve(process.env.DATA_DIR || join(ROOT_DIR, 'data'));
 const port = parseInt(process.env.PORT || '8080', 10);
 
 // 确保数据目录存在
@@ -160,74 +160,15 @@ function createEnv() {
 /**
  * 根据请求路径查找对应的 function 文件
  */
-function findFunctionFile(pathname) {
-    const parts = pathname.split('/').filter(Boolean);
-
-    // 1. 尝试精确匹配
-    if (parts.length > 0) {
-        const exactFile = join(FUNCTIONS_DIR, ...parts) + '.js';
-        if (existsSync(exactFile) && statSync(exactFile).isFile()) {
-            return { file: exactFile, params: {} };
-        }
-    }
-
-    // 2. 尝试 index.js 匹配
-    if (parts.length > 0) {
-        const indexFile = join(FUNCTIONS_DIR, ...parts, 'index.js');
-        if (existsSync(indexFile) && statSync(indexFile).isFile()) {
-            return { file: indexFile, params: {} };
-        }
-    }
-
-    // 3. 尝试 [[path]].js 通配符匹配（从深到浅）
-    for (let i = parts.length; i >= 0; i--) {
-        const dirParts = parts.slice(0, i);
-        const dirPath = join(FUNCTIONS_DIR, ...dirParts);
-        if (existsSync(dirPath) && statSync(dirPath).isDirectory()) {
-            const catchAllFile = join(dirPath, '[[path]].js');
-            if (existsSync(catchAllFile) && statSync(catchAllFile).isFile()) {
-                const pathParam = parts.slice(i);
-                return { file: catchAllFile, params: { path: pathParam } };
-            }
-        }
-    }
-
-    return null;
-}
-
-/**
- * 查找请求路径对应的中间件链
- */
-const middlewareCache = new Map();
+const findFunctionFile = functionRouter.findFunctionFile;
 
 async function findMiddlewares(pathname) {
-    const parts = pathname.split('/').filter(Boolean);
-    const allMiddlewares = [];
-
-    // 检查根 functions 目录
-    const rootMiddleware = join(FUNCTIONS_DIR, '_middleware.js');
-    if (existsSync(rootMiddleware)) {
-        const mod = await importModule(rootMiddleware);
-        if (mod.onRequest) {
-            const handlers = Array.isArray(mod.onRequest) ? mod.onRequest : [mod.onRequest];
-            allMiddlewares.push(...handlers);
-        }
+    const handlers = [];
+    for (const file of functionRouter.findMiddlewareFiles(pathname)) {
+        const mod = await importModule(file);
+        if (mod.onRequest) handlers.push(...(Array.isArray(mod.onRequest) ? mod.onRequest : [mod.onRequest]));
     }
-
-    // 逐级检查子目录中间件
-    for (let i = 1; i <= parts.length; i++) {
-        const dirParts = parts.slice(0, i);
-        const middlewareFile = join(FUNCTIONS_DIR, ...dirParts, '_middleware.js');
-        if (existsSync(middlewareFile) && statSync(middlewareFile).isFile()) {
-            const mod = await importModule(middlewareFile);
-            if (mod.onRequest) {
-                const handlers = Array.isArray(mod.onRequest) ? mod.onRequest : [mod.onRequest];
-                allMiddlewares.push(...handlers);
-            }
-        }
-    }
-
-    return allMiddlewares;
+    return handlers;
 }
 
 /**
@@ -282,6 +223,7 @@ async function handleFunctionRequest(originalRequest, pathname) {
     const requestUrl = new URL(originalRequest.url);
     const internalOrigin = `http://localhost:${port}`;
     if (requestUrl.origin !== internalOrigin) {
+        if (selfOrigins.size >= 32 && !selfOrigins.has(requestUrl.origin)) selfOrigins.delete(selfOrigins.values().next().value);
         selfOrigins.add(requestUrl.origin);
     }
 
@@ -391,6 +333,7 @@ app.all('*', async (c, next) => {
                         method: request.method,
                         headers: newHeaders,
                         body: request.body,
+                        signal: request.signal,
                         duplex: 'half',
                     });
                 }
@@ -432,7 +375,13 @@ let backupRunning = false;
 setInterval(async () => {
     if (backupRunning) return;
     backupRunning = true;
-    try { await refreshOriginChannels(); sharedStateReady = true; await drainTelegramBackups(createEnv()); }
+    try {
+        await refreshOriginChannels();
+        sharedStateReady = true;
+        const env = createEnv();
+        const results = await Promise.allSettled([runMaintenance(env), drainTelegramBackups(env, 1)]);
+        for (const result of results) if (result.status === 'rejected') console.error('Background task:', result.reason?.message);
+    }
     catch (error) { console.error('Backup worker:', error.message); }
     finally { backupRunning = false; }
 }, 60000).unref();

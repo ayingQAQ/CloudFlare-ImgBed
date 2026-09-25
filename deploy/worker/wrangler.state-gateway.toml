@@ -4,6 +4,9 @@ compatibility_date = "2024-08-21"
 workers_dev = true
 keep_vars = true
 
+[vars]
+BACKUP_JSON_MAX_BYTES = "33554432"
+
 [[d1_databases]]
 binding = "img_d1"
 database_name = "imgbed-shared"
@@ -12,3 +15,11 @@ database_id = "c6ffa93f-e9db-49ca-af62-9b2f2adf4412"
 [[r2_buckets]]
 binding = "img_r2"
 bucket_name = "imgbed-r2"
+
+[[durable_objects.bindings]]
+name = "HF_COMMITS"
+class_name = "HFCommitCoordinator"
+
+[[migrations]]
+tag = "hf-commit-v1"
+new_sqlite_classes = ["HFCommitCoordinator"]

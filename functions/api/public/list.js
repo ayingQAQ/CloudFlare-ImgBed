@@ -4,6 +4,7 @@
  */
 import { fetchOthersConfig } from "../../utils/sysConfig";
 import { readIndex } from '../../utils/indexManager.js';
+import { getDatabase } from '../../utils/databaseAdapter.js';
 
 // CORS 跨域响应头
 const corsHeaders = {
@@ -188,6 +189,29 @@ export async function onRequest(context) {
         // 解析分页参数
         const start = parseInt(url.searchParams.get('start'), 10) || 0;
         const count = parseInt(url.searchParams.get('count'), 10) || 50;
+
+        if (typeof getDatabase(env).queryFiles === 'function') {
+            const result = await readIndex(context, {
+                directory: dir, start: Math.max(0, start), count: Math.min(1000, Math.max(1, count)),
+                cursor: url.searchParams.get('cursor') || undefined,
+                directoryCursor: url.searchParams.get('directoryCursor') || undefined,
+                includeSubdirFiles: recursive, accessStatus: 'normal', excludePrefixes: ['guest/'],
+                search, searchIdOnly: true, extensionType: fileType, filterDirectories: false,
+            });
+            if (!result.success) return new Response(JSON.stringify({ error: 'File list unavailable' }), {
+                status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders }
+            });
+            return new Response(JSON.stringify({
+                files: result.files.map(file => ({ name: file.id, metadata: {
+                    FileType: file.metadata?.FileType, TimeStamp: file.metadata?.TimeStamp, FileSize: file.metadata?.FileSize
+                } })),
+                directories: result.directories.filter(path => isAllowedDirectory(path, allowedDirs)),
+                totalCount: recursive ? result.totalCount : result.directFileCount,
+                returnedCount: result.returnedCount, cursor: result.cursor,
+                directoryCursor: result.directoryCursor, directoriesTruncated: result.directoriesTruncated,
+                allowedDirs, fromCache: false,
+            }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
 
         // 获取文件列表（带缓存）
         const cachedData = await getPublicFileList(context, url, dir, recursive);

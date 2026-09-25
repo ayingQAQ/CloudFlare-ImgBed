@@ -50,14 +50,31 @@ export async function resolvePublicFile(env, alias, loadFiles) {
         }
         throw new Error('Public link relocation chain is too long');
     }
-    // Old files receive aliases on first use, without moving their storage objects.
-    const files = await loadFiles();
-    for (const file of files) {
-        const id = file.id || file.name;
-        if (await publicFileId(id) === alias) {
-            await registerPublicFile(env, id);
-            return id;
-        }
-    }
+    // Unknown public input never starts a library scan. Legacy mappings are filled
+    // by bounded maintenance, independently of requests for arbitrary aliases.
     return null;
+}
+
+const BACKFILL_KEY = 'manage@public-file-backfill@v1';
+export async function resetPublicFileAliasBackfill(env) {
+    await getDatabase(env).put(BACKFILL_KEY, JSON.stringify({ cursor: null, complete: false }));
+}
+
+export async function backfillPublicFileAliases(env, { limit = 100 } = {}) {
+    const db = getDatabase(env);
+    const state = JSON.parse(await db.get(BACKFILL_KEY) || '{}');
+    if (state.complete) return { processed: 0, complete: true };
+    const page = await db.list({ limit: Math.min(1000, Math.max(1, Number(limit) || 100)), cursor: state.cursor || undefined });
+    let processed = 0;
+    for (const file of page.keys || []) {
+        const id = file.name;
+        if (/^(manage@|chunk_|upload_session_|multipart_)/.test(id) || !file.metadata?.TimeStamp) continue;
+        const alias = await publicFileId(id);
+        // Preserve existing relocations if an old ID is reintroduced later.
+        if (!await db.get(PREFIX + alias)) await db.put(PREFIX + alias, id);
+        processed++;
+    }
+    const complete = page.list_complete === true || !page.cursor;
+    await db.put(BACKFILL_KEY, JSON.stringify({ cursor: page.cursor || null, complete }));
+    return { processed, complete, cursor: page.cursor || null };
 }

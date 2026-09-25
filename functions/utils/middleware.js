@@ -7,7 +7,7 @@ let disableTelemetry = false;
 
 export async function errorHandling(context) {
   // 读取KV中的设置
-  const othersConfig = await fetchOthersConfig(context.env);
+  const othersConfig = await fetchOthersConfig(context.env, context);
   disableTelemetry = !othersConfig.telemetry.enabled;
 
   const env = context.env;
@@ -32,59 +32,23 @@ export async function errorHandling(context) {
 }
 
 export async function telemetryData(context) {
-  // 读取KV中的设置
-  const othersConfig = await fetchOthersConfig(context.env);
-  disableTelemetry = !othersConfig.telemetry.enabled;
-  
-  if (!disableTelemetry) {
+  const othersConfig = await fetchOthersConfig(context.env, context);
+  let transaction;
+  if (othersConfig.telemetry.enabled && context.data?.sentry) {
     try {
-      const parsedHeaders = {};
-      context.request.headers.forEach((value, key) => {
-        parsedHeaders[key] = value
-        //check if the value is empty
-        if (value.length > 0) {
-          context.data.sentry.setTag(key, value);
-        }
-      });
-      const CF = JSON.parse(JSON.stringify(context.request.cf));
-      const parsedCF = {};
-      for (const key in CF) {
-        if (typeof CF[key] == "object") {
-          parsedCF[key] = JSON.stringify(CF[key]);
-        } else {
-          parsedCF[key] = CF[key];
-          if (CF[key].length > 0) {
-            context.data.sentry.setTag(key, CF[key]);
-          }
-        }
-      }
-      const data = {
-        headers: parsedHeaders,
-        cf: parsedCF,
-        url: context.request.url,
-        method: context.request.method,
-        redirect: context.request.redirect,
-      }
-      //get the url path
-      const urlPath = new URL(context.request.url).pathname;
-      const hostname = new URL(context.request.url).hostname;
-      context.data.sentry.setTag("path", urlPath);
-      context.data.sentry.setTag("url", data.url);
-      context.data.sentry.setTag("method", context.request.method);
-      context.data.sentry.setTag("redirect", context.request.redirect);
-      context.data.sentry.setContext("request", data);
-      const transaction = context.data.sentry.startTransaction({ name: `${context.request.method} ${hostname}` });
-      //add the transaction to the context
+      const sentry = context.data.sentry;
+      // Reconstructed Requests need not retain the Cloudflare cf property.
+      const cf = context.request.cf || {};
+      sentry.setTag('path', new URL(context.request.url).pathname);
+      sentry.setTag('method', context.request.method);
+      sentry.setContext('request', { cf, method: context.request.method });
+      transaction = sentry.startTransaction({ name: `${context.request.method} ${new URL(context.request.url).hostname}` });
       context.data.transaction = transaction;
-      return await context.next();
-    } catch (e) {
-      console.log(e);
-    } finally {
-      context.data.transaction.finish();
-    }
+    } catch { /* Optional instrumentation must never interrupt an upload. */ }
   }
-
-  return context.next();
+  // Invoke the handler exactly once; never replay writes after handler failure.
+  try { return await context.next(); }
+  finally { try { transaction?.finish(); } catch { /* Preserve the application result. */ } }
 }
 
 export async function traceData(context, span, op, name) {

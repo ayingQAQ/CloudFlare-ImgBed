@@ -299,8 +299,8 @@ export function getImageDimensions(buffer, fileType) {
 }
 
 // 图像审查
-export async function moderateContent(env, url) {
-    const securityConfig = await fetchSecurityConfig(env);
+export async function moderateContent(env, url, context = null) {
+    const securityConfig = context?.securityConfig || await fetchSecurityConfig(env, { context });
     const uploadModerate = securityConfig.upload.moderate;
 
     const enableModerate = uploadModerate && uploadModerate.enabled;

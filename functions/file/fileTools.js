@@ -1,3 +1,4 @@
+import { fetchUpstream } from '../utils/upstreamFetch.js';
 /* ======== 文件读取工具函数 ======== */
 
 // 判断请求域名是否在允许的域名列表中
@@ -125,18 +126,22 @@ export async function getFileContent(request, targetUrl, max_retries = 2) {
     let retries = 0;
     while (retries <= max_retries) {
         try {
-            const response = await fetch(targetUrl, {
+            const response = await fetchUpstream(targetUrl, {
                 method,
                 headers,
+                signal: request.signal,
             });
             if (response.ok || response.status === 304) {
                 return response;
             } else if (response.status === 404) {
+                await response.body?.cancel();
                 return new Response('Error: Image Not Found', { status: 404 });
             } else {
+                await response.body?.cancel();
                 retries++;
             }
         } catch (error) {
+            request.signal?.throwIfAborted();
             retries++;
         }
     }

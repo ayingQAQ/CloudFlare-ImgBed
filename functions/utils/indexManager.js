@@ -135,6 +135,8 @@ export async function batchAddFilesToIndex(context, files, options = {}) {
             options: { skipExisting }
         });
 
+        await promiseLimit(processedFiles.map(file => () => registerPublicFile(env, file.fileId)), 8);
+
         console.log(`Batch add operation recorded with ID: ${operationId}, ${files.length} files`);
         return {
             success: true,
@@ -309,6 +311,8 @@ export async function mergeOperationsToIndex(context, options = {}) {
     const { cleanupAfterMerge = true } = options;
     
     try {
+        const pending = await getDatabase(context.env).list({ prefix: OPERATION_KEY_PREFIX, limit: 1 });
+        if (!pending.keys.length) return { success: true, processedOperations: 0 };
         console.log('Starting operations merge...');
         
         // 获取当前索引
@@ -332,14 +336,15 @@ export async function mergeOperationsToIndex(context, options = {}) {
             return {
                 success: true,
                 processedOperations: 0,
-                message: 'No pending operations'
+                message: 'No pending operations',
+                index: currentIndex
             };
         }
 
         console.log(`Found ${operations.length} pending operations to merge. Is all operations: ${isALLOperations}, if there are remaining operations they will be processed in the next merge.`);
 
         // 按时间戳排序操作，确保按正确顺序应用
-        operations.sort((a, b) => a.timestamp - b.timestamp);
+        operations.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
 
         // 创建索引的副本进行操作
         const workingIndex = currentIndex;
@@ -432,22 +437,6 @@ export async function mergeOperationsToIndex(context, options = {}) {
             await cleanupOperations(context, processedOperationIds);
         }
 
-        // 如果未处理完所有操作，调用 merge-operations API 递归处理
-        if (!isALLOperations) {
-            console.log('There are remaining operations, will process them in subsequent calls.');
-
-            const headers = new Headers(request.headers);
-            const originUrl = new URL(request.url);
-            const mergeUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=merge-operations`;
-
-            await fetch(mergeUrl, { method: 'GET', headers });
-
-            return {
-                success: false,
-                error: 'There are remaining operations, will process them in subsequent calls.'
-            };
-        }
-
         const result = {
             success: true,
             processedOperations: operationsProcessed,
@@ -455,9 +444,11 @@ export async function mergeOperationsToIndex(context, options = {}) {
             updatedCount,
             removedCount,
             movedCount,
-            totalFiles: workingIndex.totalCount
+            totalFiles: workingIndex.totalCount,
+            hasMore: !isALLOperations
         };
 
+        Object.defineProperty(result, 'index', { value: workingIndex });
         console.log('Operations merge completed:', result);
         return result;
 
@@ -491,6 +482,8 @@ export async function mergeOperationsToIndex(context, options = {}) {
  */
 export async function readIndex(context, options = {}) {
     try {
+        const db = getDatabase(context.env);
+        if (typeof db.queryFiles === 'function') return await db.queryFiles(options);
         const {
             search = '',
             directory = '',
@@ -526,7 +519,7 @@ export async function readIndex(context, options = {}) {
         }
 
         // 获取当前索引
-        const index = await getIndex(context);
+        const index = mergeResult.index || await getIndex(context);
         if (!index.success) {
             throw new Error('Failed to get index');
         }
@@ -747,6 +740,7 @@ export async function readIndex(context, options = {}) {
             directFolderCount: directFolderCount,
             indexLastUpdated: index.lastUpdated,
             returnedCount: resultFiles.length,
+            pendingOperations: mergeResult.hasMore || false,
             success: true
         };
 
@@ -781,7 +775,8 @@ export async function rebuildIndex(context, progressCallback = null) {
             files: [],
             lastUpdated: Date.now(),
             totalCount: 0,
-            lastOperationId: null
+            lastOperationId: null,
+            metadataSnapshot: await db.get(INDEX_META_KEY)
         };
 
         // 分批读取所有文件
@@ -841,7 +836,8 @@ export async function rebuildIndex(context, progressCallback = null) {
         }
 
         // 清除旧的操作记录和多余索引
-        waitUntil(deleteAllOperations(context));
+        // Keep operation records: uploads may have committed during the rebuild.
+        // The next merge replays them idempotently instead of deleting unseen work.
         waitUntil(clearChunkedIndex(context, true));
 
 
@@ -1682,11 +1678,11 @@ async function getIndex(context) {
             return index;
         } else {
             // 如果加载失败，触发重建索引
-            waitUntil(rebuildIndex(context));
+            if (waitUntil) waitUntil(rebuildIndex(context));
         }
     } catch (error) {
         console.warn('Error reading index, creating new one:', error);
-        waitUntil(rebuildIndex(context));
+        if (waitUntil) waitUntil(rebuildIndex(context));
     }
     
     // 返回空的索引结构
@@ -1887,13 +1883,16 @@ async function promiseLimit(tasks, concurrency = BATCH_SIZE) {
  * @param {Object} index - 完整的索引对象
  * @returns {Promise<boolean>} 是否保存成功
  */
-async function saveChunkedIndex(context, index) {
+export async function saveChunkedIndex(context, index) {
     const { env } = context;
     const db = getDatabase(env);
     const chunkSize = getIndexChunkSize(env);
     
     try {
         const files = index.files || [];
+        const generation = `${Date.now()}-${crypto.randomUUID()}`;
+        const previousMetadata = JSON.parse(index.metadataSnapshot || '{}');
+        const cleanupDue = (previousMetadata.gcAfter || 0) <= Date.now();
         const chunks = [];
         
         // 将文件数组分块
@@ -1929,19 +1928,30 @@ async function saveChunkedIndex(context, index) {
             channelStats,
             lastOperationId: index.lastOperationId,
             chunkCount: chunks.length,
-            chunkSize: chunkSize
+            chunkSize: chunkSize,
+            generation,
+            gcAfter: cleanupDue ? Date.now() + 86400000 : previousMetadata.gcAfter
         };
         
-        await db.put(INDEX_META_KEY, JSON.stringify(metadata));
-        
+        // Write immutable chunks first. A failed write must not advance the pointer.
         // 保存各个分块
-        const savePromises = chunks.map((chunk, chunkId) => {
-            const chunkKey = `${INDEX_KEY}_${chunkId}`;
-            return db.put(chunkKey, JSON.stringify(chunk));
-        });
-        
-        await Promise.all(savePromises);
-        
+        for (let first = 0; first < chunks.length; first += 8) {
+            await Promise.all(chunks.slice(first, first + 8).map((chunk, offset) =>
+                db.put(`${INDEX_KEY}_${metadata.generation}_${first + offset}`, JSON.stringify(chunk))));
+        }
+        const expected = index.metadataSnapshot ?? null;
+        if (typeof db.compareAndSwapSetting === 'function') {
+            if (!await db.compareAndSwapSetting(INDEX_META_KEY, expected, JSON.stringify(metadata))) {
+                throw new Error('Index changed concurrently; retry merge');
+            }
+        } else {
+            // Legacy KV has no CAS. Immutable generations still prevent torn reads.
+            if (await db.get(INDEX_META_KEY) !== expected) throw new Error('Index changed; retry merge');
+            await db.put(INDEX_META_KEY, JSON.stringify(metadata));
+        }
+        index.metadataSnapshot = JSON.stringify(metadata);
+        // Only the publishing winner schedules daily GC; keep a grace period for readers.
+        if (cleanupDue && context.waitUntil) context.waitUntil(clearChunkedIndex(context, true));
         console.log(`Saved chunked index: ${chunks.length} chunks, ${files.length} total files, ${totalSizeMB.toFixed(2)} MB`);
         return true;
         
@@ -1956,7 +1966,7 @@ async function saveChunkedIndex(context, index) {
  * @param {Object} context - 上下文对象，包含 env
  * @returns {Promise<Object>} 完整的索引对象
  */
-async function loadChunkedIndex(context) {
+export async function loadChunkedIndex(context) {
     const { env } = context;
     const db = getDatabase(env);
 
@@ -1970,30 +1980,23 @@ async function loadChunkedIndex(context) {
         const metadata = JSON.parse(metadataStr);
         const files = [];
         
-        // 并行加载所有分块
-        const loadPromises = [];
-        for (let chunkId = 0; chunkId < metadata.chunkCount; chunkId++) {
-            const chunkKey = `${INDEX_KEY}_${chunkId}`;
-            loadPromises.push(
-                db.get(chunkKey).then(chunkStr => {
-                    if (chunkStr) {
-                        return JSON.parse(chunkStr);
-                    }
-                    return [];
-                })
-            );
+        // Keep both in-flight database calls and temporary chunk arrays bounded.
+        for (let first = 0; first < metadata.chunkCount; first += 8) {
+            const chunks = await Promise.all(Array.from({ length: Math.min(8, metadata.chunkCount - first) }, async (_, offset) => {
+                const chunkId = first + offset;
+                const key = metadata.generation ? `${INDEX_KEY}_${metadata.generation}_${chunkId}` : `${INDEX_KEY}_${chunkId}`;
+                const value = await db.get(key);
+                if (!value) throw new Error(`Missing index chunk: ${key}`);
+                const chunk = JSON.parse(value);
+                if (!Array.isArray(chunk)) throw new Error(`Invalid index chunk: ${key}`);
+                return chunk;
+            }));
+            for (const chunk of chunks) for (const file of chunk) files.push(file);
         }
-        
-        const chunks = await Promise.all(loadPromises);
-        
-        // 合并所有分块
-        chunks.forEach(chunk => {
-            if (Array.isArray(chunk)) {
-                files.push(...chunk);
-            }
-        });
-        
+
+        if (files.length !== metadata.totalCount) throw new Error('Incomplete index snapshot');
         const index = {
+            metadataSnapshot: metadataStr,
             files,
             lastUpdated: metadata.lastUpdated,
             totalCount: metadata.totalCount,
@@ -2033,9 +2036,10 @@ export async function clearChunkedIndex(context, onlyNonUsed = false) {
         // 获取元数据
         const metadataStr = await db.get(INDEX_META_KEY);
         let chunkCount = 0;
+        let metadata;
         
         if (metadataStr) {
-            const metadata = JSON.parse(metadataStr);
+            metadata = JSON.parse(metadataStr);
             chunkCount = metadata.chunkCount || 0;
 
             if (!onlyNonUsed) {
@@ -2066,12 +2070,17 @@ export async function clearChunkedIndex(context, onlyNonUsed = false) {
         if (onlyNonUsed) {
             // 如果仅清理未使用的分块索引，保留当前在使用的分块
             for (let chunkId = 0; chunkId < chunkCount; chunkId++) {
-                reservedChunks.push(`${INDEX_KEY}_${chunkId}`);
+                reservedChunks.push(metadata.generation ? `${INDEX_KEY}_${metadata.generation}_${chunkId}` : `${INDEX_KEY}_${chunkId}`);
             }
         }
 
         const deletePromises = [];
         for (let chunkKey of recordedChunks) {
+            if (onlyNonUsed) {
+                const created = chunkKey.slice((INDEX_KEY + '_').length).match(/^(\d{13})-/);
+                // Keep legacy chunks during rolling upgrades; protect active readers and writers.
+                if (!created || Date.now() - Number(created[1]) < 86400000) continue;
+            }
             if (reservedChunks.includes(chunkKey) || !chunkKey.startsWith(INDEX_KEY + '_')) {
                 // 保留的分块和非分块键不删除
                 continue;
@@ -2124,7 +2133,7 @@ export async function getIndexStorageStats(context) {
         // 检查各个分块的存在情况
         const chunkChecks = [];
         for (let chunkId = 0; chunkId < metadata.chunkCount; chunkId++) {
-            const chunkKey = `${INDEX_KEY}_${chunkId}`;
+            const chunkKey = metadata.generation ? `${INDEX_KEY}_${metadata.generation}_${chunkId}` : `${INDEX_KEY}_${chunkId}`;
             chunkChecks.push(
                 db.get(chunkKey).then(data => ({
                     chunkId,

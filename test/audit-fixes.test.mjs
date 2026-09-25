@@ -45,7 +45,7 @@ test('shared login limiter rejects the eleventh attempt and expires', async()=>{
 });
 
 test('D1 failures must not grant administrator privileges', async () => {
-    const env = { img_d1: { prepare() { return { bind() { return this; }, first() { throw Error('D1 unavailable'); } }; } } };
+    const env = { img_d1: { prepare() { return { bind() { return this; }, first() { throw Error('D1 unavailable'); }, all() { throw Error('D1 unavailable'); } }; } } };
     await assert.rejects(authenticate({ env, request: new Request('https://test/api/manage/list'), authScope: 'admin' }), /D1 unavailable/);
 });
 

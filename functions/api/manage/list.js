@@ -132,6 +132,7 @@ export async function onRequest(context) {
                 countOnly: true
             });
 
+            if (result.success === false) throw new Error('Index unavailable');
             return new Response(JSON.stringify({
                 sum: result.totalCount,
                 indexLastUpdated: result.indexLastUpdated
@@ -145,6 +146,8 @@ export async function onRequest(context) {
             search,
             directory: dir,
             start,
+            cursor: url.searchParams.get("cursor") || undefined,
+            directoryCursor: url.searchParams.get('directoryCursor') || undefined,
             count,
             channel: channelArray,
             listType: listTypeArray,
@@ -157,25 +160,17 @@ export async function onRequest(context) {
             includeSubdirFiles: recursive,
         });
 
-        // 索引读取失败，直接从 KV 中获取所有文件记录
+        // An unavailable snapshot is retriable; a fallback scan would discard filters
+        // and multiply load precisely while the index is unhealthy.
         if (!result.success) {
-            const dbRecords = await mergeDirectories(context.env, await getAllFileRecords(context.env, dir), dir);
-
-            return new Response(JSON.stringify({
-                files: dbRecords.files,
-                directories: dbRecords.directories,
-                totalCount: dbRecords.totalCount,
-                directFileCount: dbRecords.directFileCount,
-                directFolderCount: dbRecords.directFolderCount,
-                returnedCount: dbRecords.returnedCount,
-                indexLastUpdated: Date.now(),
-                isIndexedResponse: false // 标记这是来自 KV 的响应
-            }), {
-                headers: { "Content-Type": "application/json", ...corsHeaders }
+            return new Response(JSON.stringify({ error: 'Index unavailable; retry shortly' }), {
+                status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '5', ...corsHeaders }
             });
         }
 
+        const indexedFolderCount = result.directFolderCount;
         await mergeDirectories(context.env, result, dir);
+        result.directFolderCount = Math.max(indexedFolderCount || 0, result.directFolderCount);
         const db = getDatabase(context.env);
         const metadataViewContext = await createMetadataViewContext(db, context.env);
 
@@ -191,6 +186,10 @@ export async function onRequest(context) {
             directFileCount: result.directFileCount,
             directFolderCount: result.directFolderCount,
             returnedCount: result.returnedCount,
+            cursor: result.cursor || null,
+            directoriesTruncated: result.directoriesTruncated || false,
+            directoryCursor: result.directoryCursor || null,
+            pendingOperations: result.pendingOperations || false,
             indexLastUpdated: result.indexLastUpdated,
             isIndexedResponse: true // 标记这是来自索引的响应
         }), {
@@ -206,84 +205,5 @@ export async function onRequest(context) {
             status: 500,
             headers: { "Content-Type": "application/json", ...corsHeaders }
         });
-    }
-}
-
-async function getAllFileRecords(env, dir) {
-    const allRecords = [];
-    let cursor = null;
-
-    try {
-        const db = getDatabase(env);
-        const metadataViewContext = await createMetadataViewContext(db, env);
-
-        while (true) {
-            const response = await db.list({
-                prefix: dir,
-                limit: 1000,
-                cursor: cursor
-            });
-
-            // 检查响应格式
-            if (!response || !response.keys || !Array.isArray(response.keys)) {
-                console.error('Invalid response from database list:', response);
-                break;
-            }
-
-            cursor = response.cursor;
-
-            for (const item of response.keys) {
-                // 跳过管理相关的键
-                if (item.name.startsWith('manage@') || item.name.startsWith('chunk_')) {
-                    continue;
-                }
-
-                // 跳过没有元数据的文件
-                if (!item.metadata || !item.metadata.TimeStamp) {
-                    continue;
-                }
-
-                allRecords.push(await serializeFileRecordForManagement(db, env, item, metadataViewContext));
-            }
-
-            if (!cursor) break;
-
-            // 添加协作点
-            await new Promise(resolve => setTimeout(resolve, 10));
-        }
-
-        // 提取目录信息
-        const directories = new Set();
-        const filteredRecords = [];
-        allRecords.forEach(item => {
-            const subDir = item.name.substring(dir.length);
-            const firstSlashIndex = subDir.indexOf('/');
-            if (firstSlashIndex !== -1) {
-                directories.add(dir + subDir.substring(0, firstSlashIndex));
-            } else {
-                filteredRecords.push(item);
-            }
-        });
-
-        return {
-            files: filteredRecords,
-            directories: Array.from(directories),
-            totalCount: allRecords.length,
-            directFileCount: filteredRecords.length,
-            directFolderCount: directories.size,
-            returnedCount: filteredRecords.length
-        };
-
-    } catch (error) {
-        console.error('Error in getAllFileRecords:', error);
-        return {
-            files: [],
-            directories: [],
-            totalCount: 0,
-            directFileCount: 0,
-            directFolderCount: 0,
-            returnedCount: 0,
-            error: error.message
-        };
     }
 }

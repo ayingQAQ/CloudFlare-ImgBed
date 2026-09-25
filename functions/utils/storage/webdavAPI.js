@@ -1,3 +1,4 @@
+import { fetchUpstream } from '../upstreamFetch.js';
 /**
  * WebDAV API helper
  *
@@ -85,10 +86,11 @@ export class WebDAVAPI {
     }
 
     async getFile(path, options = {}) {
-        const response = await fetch(this.buildObjectUrl(path), {
+        const response = await fetchUpstream(this.buildObjectUrl(path), {
             method: options.method || 'GET',
             headers: this.getRequestHeaders(options.headers || {}),
             redirect: 'manual',
+            signal: options.signal,
         });
 
         if (!isSuccessStatus(response.status) && response.status !== 304) {

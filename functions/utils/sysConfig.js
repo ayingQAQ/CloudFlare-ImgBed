@@ -5,6 +5,22 @@ import { getOthersConfig } from '../api/manage/sysConfig/others.js';
 import { getDatabase } from './databaseAdapter.js';
 import { getIndexMeta } from './indexManager.js';
 
+// Lifetime is the request, never the environment or an isolate-wide auth cache.
+const requestConfigData = new WeakMap();
+export function bindRequestConfig(context, request = context.request) {
+    context.data ||= {};
+    if (request) requestConfigData.set(request, context.data);
+    return context.data;
+}
+
+function requestConfig(context, key, load) {
+    const data = context?.data || requestConfigData.get(context?.request || context);
+    if (!data) return load();
+    data.configReads ||= new Map();
+    if (!data.configReads.has(key)) data.configReads.set(key, load());
+    return data.configReads.get(key);
+}
+
 /**
  * 根据容量限制过滤渠道
  * @param {Object} context - 上下文对象（包含 env）
@@ -53,7 +69,11 @@ async function filterChannelsByQuota(context, channels) {
     return result;
 }
 
-export async function fetchUploadConfig(env, context = null) {
+export function fetchUploadConfig(env, context = null) {
+    return requestConfig(context, 'upload', () => loadUploadConfig(env, context));
+}
+
+async function loadUploadConfig(env, context) {
     try {
         const db = getDatabase(env);
         const settings = await getUploadConfig(db, env);
@@ -91,7 +111,7 @@ export async function fetchUploadConfig(env, context = null) {
 export async function fetchSecurityConfig(env, options = {}) {
     try {
         const db = getDatabase(env);
-        const settings = await getSecurityConfig(db, env);
+        const settings = await requestConfig(options.context || options.request, 'security', () => getSecurityConfig(db, env));
         return settings;
     } catch (error) {
         console.error('Failed to fetch security config:', error);
@@ -125,10 +145,10 @@ export async function fetchSecurityConfig(env, options = {}) {
     }
 }
 
-export async function fetchPageConfig(env) {
+export async function fetchPageConfig(env, context = null) {
     try {
         const db = getDatabase(env);
-        const settings = await getPageConfig(db, env);
+        const settings = await requestConfig(context, 'page', () => getPageConfig(db, env));
         return settings;
     } catch (error) {
         console.error('Failed to fetch page config:', error);
@@ -137,10 +157,10 @@ export async function fetchPageConfig(env) {
     }
 }
 
-export async function fetchOthersConfig(env) {
+export async function fetchOthersConfig(env, context = null) {
     try {
         const db = getDatabase(env);
-        const settings = await getOthersConfig(db, env);
+        const settings = await requestConfig(context, 'others', () => getOthersConfig(db, env));
         return settings;
     } catch (error) {
         console.error('Failed to fetch others config:', error);

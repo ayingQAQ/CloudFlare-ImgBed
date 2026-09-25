@@ -98,7 +98,7 @@ export async function authenticate({
     authScope = AUTH_SCOPE.EITHER,
 }) {
     // 读取安全配置
-    const securityConfig = await fetchSecurityConfig(env, { throwOnError: true });
+    const securityConfig = await fetchSecurityConfig(env, { throwOnError: true, request });
     const adminUsername = securityConfig.auth.admin.adminUsername;
     const adminPassword = securityConfig.auth.admin.adminPassword;
     const userAuthCode = securityConfig.auth.user.authCode;

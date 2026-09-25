@@ -81,7 +81,8 @@ export async function withOriginFallback(request, env, ctx, primary, originFetch
             const result = await primary(request, env, ctx);
             if (result.status >= 500) openUntil.set(hostname, Date.now() + 30000);
             return result;
-        } catch {
+        } catch (error) {
+            console.error('Primary mutation failed', error?.stack || error?.message || error);
             openUntil.set(hostname, Date.now() + 30000);
             return new Response('Primary unavailable; subsequent requests will use origin', { status: 503, headers: { 'Cache-Control': 'no-store' } });
         }

@@ -1,3 +1,4 @@
+import { createChunkedStream, parseByteRange } from '../file/chunkedStream.js';
 import { r2Put } from './r2Write.js';
 import { getDatabase } from './databaseAdapter.js';
 import { fetchUploadConfig } from './sysConfig.js';
@@ -6,6 +7,9 @@ import { TelegramAPI } from './storage/telegramAPI.js';
 
 const PENDING = `${INTERNAL_PREFIX}telegram/pending/`;
 const COMPLETE = `${INTERNAL_PREFIX}telegram/complete/`;
+const WORKER_SLOT = `${INTERNAL_PREFIX}telegram/worker-slot.json`;
+const WORKER_LEASE_MS = 180000;
+const WORKER_BUDGET_MS = 90000;
 const CURSOR = `${INTERNAL_PREFIX}telegram/cursor.json`;
 const CHUNK_SIZE = 8 * 1024 * 1024;
 const TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
@@ -76,14 +80,15 @@ export async function enqueueTelegramBackup(context, fileId, primaryChannel) {
     context.waitUntil(processTelegramBackup(context.env, id).catch(error => console.error('Backup worker:', error.message)));
 }
 
-async function readSlice(env, job, config, start, end) {
+async function readSlice(env, job, config, start, end, signal) {
+    signal?.throwIfAborted();
     if (end === start) return new Blob([]);
     if (job.primaryChannel === 'cfr2') {
         const object = await env.img_r2.get(job.fileId, {
             range: { offset: start, length: end - start }, onlyIf: { etagMatches: job.sourceEtag },
         });
         if (!object?.body) throw new Error('R2 backup source changed or was deleted');
-        const blob = await new Response(object.body).blob();
+        const blob = await boundedBackupBlob(object.body, end - start, signal);
         if (blob.size !== end - start) throw new Error('Incomplete R2 range');
         return blob;
     }
@@ -92,7 +97,7 @@ async function readSlice(env, job, config, start, end) {
     const url = `https://huggingface.co/datasets/${encodePath(channel.repo)}/resolve/main/${encodePath(job.metadata.HfFilePath)}`;
     const response = await fetch(url, {
         headers: { Authorization: `Bearer ${channel.token}`, Range: `bytes=${start}-${end - 1}` },
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
     });
     if (!response.ok || (response.status !== 206 && (start !== 0 || end !== job.size))) {
         await response.body?.cancel();
@@ -102,21 +107,33 @@ async function readSlice(env, job, config, start, end) {
         await response.body?.cancel();
         throw new Error('Unexpected Hugging Face content range');
     }
-    // Bound reads even if an upstream ignores its Content-Length/Range headers.
-    const reader = response.body.getReader();
+    const blob = await boundedBackupBlob(response.body, end - start, signal);
+    if (blob.size !== end - start) throw new Error('Incomplete Hugging Face range');
+    return blob;
+}
+
+async function boundedBackupBlob(body, limit, signal) {
+    const reader = body.getReader();
+    const abort = () => reader.cancel(signal.reason).catch(() => {});
+    signal?.addEventListener('abort', abort, { once: true });
     const chunks = [];
-    let size = 0;
+    let bytes = 0;
     try {
+        signal?.throwIfAborted();
         while (true) {
             const part = await reader.read();
+            signal?.throwIfAborted();
             if (part.done) break;
-            size += part.value.byteLength;
-            if (size > end - start) throw new Error('Oversized Hugging Face range');
+            bytes += part.value.byteLength;
+            if (bytes > limit) throw new Error('Backup source exceeds byte limit');
             chunks.push(part.value);
         }
-    } finally { await reader.cancel(); }
-    if (size !== end - start) throw new Error('Incomplete Hugging Face range');
-    return new Blob(chunks);
+        return new Blob(chunks);
+    } finally {
+        signal?.removeEventListener('abort', abort);
+        chunks.length = 0;
+        void reader.cancel().catch(() => {});
+    }
 }
 
 function previewImageType(job) {
@@ -131,15 +148,15 @@ function shouldSendPreview(job) {
     );
 }
 
-async function createTelegramPreview(env, job, config) {
+async function createTelegramPreview(env, job, config, signal) {
     if (job.size <= TG_PHOTO_MAX_BYTES) {
-        return { blob: await readSlice(env, job, config, 0, job.size), type: previewImageType(job), suffix: '' };
+        return { blob: await readSlice(env, job, config, 0, job.size, signal), type: previewImageType(job), suffix: '' };
     }
     if (!job.origin) throw new Error('Large image preview source URL is unavailable');
     const sourceUrl = `${job.origin}/file/${encodePath(job.fileId)}?telegram-preview=${encodeURIComponent(job.id)}`;
     const response = await fetch(sourceUrl, {
         cf: { image: { width: 1920, height: 1920, fit: 'scale-down', quality: 76, format: 'jpeg' } },
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
     });
     if (!response.ok || !response.body) {
         await response.body?.cancel();
@@ -150,24 +167,25 @@ async function createTelegramPreview(env, job, config) {
         await response.body.cancel();
         throw new Error('Cloudflare preview transform is still larger than 10 MB');
     }
-    const blob = await response.blob();
+    const blob = await boundedBackupBlob(response.body, TG_PHOTO_MAX_BYTES, signal);
     if (blob.size > TG_PHOTO_MAX_BYTES) throw new Error('Cloudflare preview transform is still larger than 10 MB');
     return { blob, type: 'image/jpeg', suffix: '.preview.jpg' };
 }
 
-async function sendTelegramPreview(env, job, config, channel) {
+async function sendTelegramPreview(env, job, config, channel, signal) {
+    signal.throwIfAborted();
     const form = new FormData();
     form.set('chat_id', channel.chatId);
     const type = previewImageType(job);
     const isVideo = PREVIEW_VIDEO_TYPES.has(type);
     let method;
     if (isVideo) {
-        const video = await readSlice(env, job, config, 0, job.size);
+        const video = await readSlice(env, job, config, 0, job.size, signal);
         form.set('video', new Blob([video], { type }), job.metadata.FileName || 'video.mp4');
         form.set('supports_streaming', 'true');
         method = 'sendVideo';
     } else {
-        const preview = await createTelegramPreview(env, job, config);
+        const preview = await createTelegramPreview(env, job, config, signal);
         form.set('photo', new Blob([preview.blob], { type: preview.type || 'image/jpeg' }),
             `${job.metadata.FileName || 'preview'}${preview.suffix}`);
         method = 'sendPhoto';
@@ -180,7 +198,7 @@ async function sendTelegramPreview(env, job, config, channel) {
     ].join('\n'));
     const api = new TelegramAPI(channel.botToken, channel.proxyUrl || '');
     const response = await fetch(`${api.baseURL}/${method}`, {
-        method: 'POST', body: form, signal: AbortSignal.timeout(isVideo ? 60000 : 15000),
+        method: 'POST', body: form, signal: AbortSignal.any([signal, AbortSignal.timeout(isVideo ? 60000 : 15000)]),
     });
     const result = await response.json();
     if (!response.ok || !result.ok || !result.result?.message_id) {
@@ -192,7 +210,32 @@ async function sendTelegramPreview(env, job, config, channel) {
         kind: isVideo ? 'video' : 'photo', createdAt: Date.now() };
 }
 
+// All request, timer and scheduled workers compete for the same durable slot.
+// Claim it before reading source bytes or constructing a preview. A crashed worker
+// loses the lease; a live worker cancels I/O before the lease can expire.
 export async function processTelegramBackup(env, id) {
+    const bucket = env.img_r2;
+    const previous = await bucket.get(WORKER_SLOT);
+    const slot = previous ? await json(previous) : null;
+    if (slot?.until > Date.now()) return 'busy';
+    const startedAt = Date.now();
+    const claim = await r2Put(bucket, WORKER_SLOT, JSON.stringify({ token: crypto.randomUUID(), until: startedAt + WORKER_LEASE_MS }), {
+        onlyIf: previous ? { etagMatches: previous.etag } : { etagDoesNotMatch: '*' },
+    });
+    if (!claim) return 'busy';
+    const controller = new AbortController();
+    const remainingMs = WORKER_BUDGET_MS - (Date.now() - startedAt);
+    if (remainingMs <= 0) controller.abort(new Error('Backup worker admission expired'));
+    const timer = setTimeout(() => controller.abort(new Error('Backup worker deadline exceeded')), Math.max(0, remainingMs));
+    try { controller.signal.throwIfAborted(); return await processClaimedBackup(env, id, controller.signal); }
+    finally {
+        clearTimeout(timer);
+        // Conditional release cannot clear another worker's recovered slot.
+        await r2Put(bucket, WORKER_SLOT, JSON.stringify({ until: 0 }), { onlyIf: { etagMatches: claim.etag } });
+    }
+}
+
+async function processClaimedBackup(env, id, signal) {
     const bucket = env.img_r2;
     const key = PENDING + id;
     const object = await bucket.get(key);
@@ -200,7 +243,7 @@ export async function processTelegramBackup(env, id) {
     const job = await json(object);
     const now = Date.now();
     if (job.leaseUntil > now || job.nextAttemptAt > now) return 'deferred';
-    job.leaseUntil = now + 120000;
+    job.leaseUntil = now + WORKER_LEASE_MS;
     job.lease = crypto.randomUUID();
     const claim = await r2Put(bucket, key, JSON.stringify(job), { onlyIf: { etagMatches: object.etag } });
     if (!claim) return 'busy';
@@ -225,7 +268,7 @@ export async function processTelegramBackup(env, id) {
             // A photo is only a human-friendly preview. The document chunks remain the recoverable copy.
             if (shouldSendPreview(job)) {
                 try {
-                    job.preview = await sendTelegramPreview(env, job, config, channel);
+                    job.preview = await sendTelegramPreview(env, job, config, channel, signal);
                 } catch (error) {
                     console.warn('Telegram media preview failed:', error.message);
                     job.preview = { status: 'failed', error: String(error.message).slice(0, 200), updatedAt: Date.now() };
@@ -235,17 +278,19 @@ export async function processTelegramBackup(env, id) {
             } else if (!job.preview && PREVIEW_VIDEO_TYPES.has(previewImageType(job)) && job.size > TG_VIDEO_MAX_BYTES) {
                 job.preview = { status: 'skipped', reason: 'video_too_large', updatedAt: Date.now() };
             }
+            signal.throwIfAborted();
             const index = job.chunks.length;
             const start = index * CHUNK_SIZE;
             const end = Math.min(start + CHUNK_SIZE, job.size);
-            const blob = await readSlice(env, job, config, start, end);
+            const blob = await readSlice(env, job, config, start, end, signal);
+            signal.throwIfAborted();
             const form = new FormData();
             form.set('chat_id', channel.chatId);
             form.set('document', blob, `${job.metadata.FileName || 'backup'}.part${String(index).padStart(5, '0')}`);
             form.set('caption', `ImgBed backup ${id} ${index + 1}/${Math.max(1, Math.ceil(job.size / CHUNK_SIZE))}`);
             const api = new TelegramAPI(channel.botToken, channel.proxyUrl || '');
             const response = await fetch(`${api.baseURL}/sendDocument`, {
-                method: 'POST', body: form, signal: AbortSignal.timeout(15000),
+                method: 'POST', body: form, signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
             });
             const result = await response.json();
             if (!response.ok || !result.ok || !result.result?.document?.file_id) {
@@ -301,45 +346,16 @@ export async function readTelegramBackup(env, fileId, metadata, request) {
     const channel = config.telegram.channels.find(c => c.name === job.channelName);
     if (!channel || channel.botToken.split(':')[0] !== job.botId) return null;
     const api = new TelegramAPI(channel.botToken, channel.proxyUrl || '');
-    let start = 0;
-    let end = job.size - 1;
-    const range = request?.headers.get('Range');
-    if (range) {
-        const match = /^bytes=(\d+)-(\d*)$/.exec(range);
-        if (!match) return new Response(null, { status: 416 });
-        start = Number(match[1]);
-        end = match[2] ? Math.min(Number(match[2]), end) : end;
-        if (start > end || start >= job.size) return new Response(null, { status: 416 });
-    }
-    let index = Math.floor(start / CHUNK_SIZE);
-    let position = index * CHUNK_SIZE;
-    let reader;
-    const body = new ReadableStream({
-        async pull(controller) {
-            try {
-                while (true) {
-                    if (!reader) {
-                        if (index === job.chunks.length || position > end) return controller.close();
-                        const response = await api.getFileContent(job.chunks[index++].fileId);
-                        if (!response.ok) throw new Error('Telegram restore failed');
-                        reader = response.body.getReader();
-                    }
-                    const part = await reader.read();
-                    if (part.done) { reader = null; continue; }
-                    const offset = Math.max(0, start - position);
-                    const length = Math.min(part.value.byteLength, end - position + 1);
-                    position += part.value.byteLength;
-                    if (length <= offset) continue;
-                    controller.enqueue(part.value.slice(offset, length));
-                    if (position > end) { await reader.cancel(); controller.close(); }
-                    return;
-                }
-            } catch (error) { controller.error(error); }
-        },
-        async cancel() { await reader?.cancel(); },
+    const requestedRange = request?.headers.get('Range');
+    const range = parseByteRange(requestedRange, job.size);
+    if (!range) return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${job.size}` } });
+    const { start, end } = range;
+    const body = request?.method === 'HEAD' || job.size === 0 ? null : createChunkedStream(job.chunks, {
+        start, end, signal: request?.signal,
+        fetchChunk: (chunk, signal) => api.getFileContent(chunk.fileId, { signal }),
     });
-    return new Response(body, { status: range ? 206 : 200, headers: {
-        ...(range ? { 'Content-Range': `bytes ${start}-${end}/${job.size}` } : {}),
+    return new Response(body, { status: range.partial ? 206 : 200, headers: {
+        ...(range.partial ? { 'Content-Range': `bytes ${start}-${end}/${job.size}` } : {}),
         'Accept-Ranges': 'bytes', 'Content-Type': job.metadata.FileType || 'application/octet-stream',
         'Content-Length': String(Math.max(0, end - start + 1)), 'Cache-Control': 'private, no-store', 'X-ImgBed-Replica': 'telegram' } });
 }

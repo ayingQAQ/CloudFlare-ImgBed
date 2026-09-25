@@ -24,3 +24,7 @@ database_id = "c6ffa93f-e9db-49ca-af62-9b2f2adf4412"
 [[r2_buckets]]
 binding = "img_r2"
 bucket_name = "imgbed-r2"
+[[durable_objects.bindings]]
+name = "HF_COMMITS"
+class_name = "HFCommitCoordinator"
+script_name = "cloudflare-imgbed-state-gateway"

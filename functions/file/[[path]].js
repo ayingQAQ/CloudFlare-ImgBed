@@ -1,4 +1,6 @@
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { createChunkedStream, parseByteRange } from './chunkedStream.js';
+import { fetchUpstream, requestUpstream, abortableDelay } from '../utils/upstreamFetch.js';
+import { S3Client, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { readTelegramBackup } from '../utils/telegramBackup.js';
 import { fetchSecurityConfig } from "../utils/sysConfig";
 import { TelegramAPI } from "../utils/storage/telegramAPI";
@@ -160,7 +162,7 @@ export async function onRequest(context) {  // Contents of context object
         }
 
         try {
-            const response = await fetch(imgRecord.metadata?.ExternalLink);
+            const response = await fetchUpstream(imgRecord.metadata?.ExternalLink, { signal: request.signal });
             if (!response.ok) return response;
 
             const headers = new Headers(response.headers);
@@ -204,7 +206,7 @@ export async function onRequest(context) {  // Contents of context object
         const TgBotToken = tgCredentials.botToken;
         const TgProxyUrl = tgCredentials.proxyUrl || '';
         const tgApi = new TelegramAPI(TgBotToken, TgProxyUrl);
-        const filePath = await tgApi.getFilePath(TgFileID);
+        const filePath = await tgApi.getFilePath(TgFileID, { signal: request.signal });
         if (filePath === null) {
             return new Response('Error: Failed to fetch image path', { status: 500 });
         }
@@ -221,6 +223,7 @@ export async function onRequest(context) {  // Contents of context object
         if (response === null) {
             return new Response('Error: Failed to fetch image', { status: 500 });
         } else if (response.status === 404) {
+            await response.body?.cancel();
             return await return404(url);
         }
 
@@ -330,24 +333,10 @@ async function handleTelegramChunkedFile(context, imgRecord, encodedFileName, fi
     }
 
     // 检查Range请求头
-    const range = request.headers.get('Range');
-    let rangeStart = 0;
-    let rangeEnd = totalSize - 1;
-    let isRangeRequest = false;
-
-    if (range) {
-        const matches = range.match(/bytes=(\d+)-(\d*)/);
-        if (matches) {
-            rangeStart = parseInt(matches[1]);
-            rangeEnd = matches[2] ? parseInt(matches[2]) : totalSize - 1;
-            isRangeRequest = true;
-
-            // 验证范围有效性
-            if (rangeStart >= totalSize || rangeEnd >= totalSize || rangeStart > rangeEnd) {
-                return new Response('Range Not Satisfiable', { status: 416 });
-            }
-        }
-    }
+    const selectedRange = parseByteRange(request.headers.get('Range'), totalSize);
+    if (!selectedRange) return new Response('Range Not Satisfiable', { status: 416, headers: { 'Content-Range': `bytes */${totalSize}` } });
+    const { start: rangeStart, end: rangeEnd, partial: isRangeRequest } = selectedRange;
+    if (isRangeRequest) setRangeHeaders(headers, rangeStart, rangeEnd, totalSize);
 
     // 处理HEAD请求
     if (request.method === 'HEAD') {
@@ -356,52 +345,9 @@ async function handleTelegramChunkedFile(context, imgRecord, encodedFileName, fi
 
     try {
         // 创建支持Range请求的流
-        const stream = new ReadableStream({
-            async start(controller) {
-                try {
-                    let currentPosition = 0;
-
-                    for (let i = 0; i < chunks.length; i++) {
-                        const chunk = chunks[i];
-                        const chunkSize = chunk.size || 0;
-
-                        // 如果当前分片完全在请求范围之前，跳过
-                        if (currentPosition + chunkSize <= rangeStart) {
-                            currentPosition += chunkSize;
-                            continue;
-                        }
-
-                        // 如果当前分片完全在请求范围之后，结束
-                        if (currentPosition > rangeEnd) {
-                            break;
-                        }
-
-                        // 获取分片数据（支持代理域名）
-                        const chunkData = await fetchTelegramChunkWithRetry(TgBotToken, chunk, TgProxyUrl, 3);
-                        if (!chunkData) {
-                            throw new Error(`Failed to fetch chunk ${chunk.index} after retries`);
-                        }
-
-                        // 计算在当前分片中的起始和结束位置
-                        const chunkStart = Math.max(0, rangeStart - currentPosition);
-                        const chunkEnd = Math.min(chunkSize, rangeEnd - currentPosition + 1);
-
-                        // 如果需要部分分片数据
-                        if (chunkStart > 0 || chunkEnd < chunkSize) {
-                            const partialData = chunkData.slice(chunkStart, chunkEnd);
-                            controller.enqueue(partialData);
-                        } else {
-                            controller.enqueue(chunkData);
-                        }
-
-                        currentPosition += chunkSize;
-                    }
-
-                    controller.close();
-                } catch (error) {
-                    controller.error(error);
-                }
-            }
+        const stream = createChunkedStream(chunks, {
+            start: rangeStart, end: rangeEnd, signal: request.signal,
+            fetchChunk: (chunk, signal) => fetchTelegramChunkWithRetry(TgBotToken, chunk, TgProxyUrl, 3, signal),
         });
 
         // 设置Range相关头部
@@ -427,41 +373,24 @@ async function handleTelegramChunkedFile(context, imgRecord, encodedFileName, fi
 }
 
 // 带重试机制的Telegram分片获取函数（支持代理域名）
-async function fetchTelegramChunkWithRetry(botToken, chunk, proxyUrl = '', maxRetries = 3) {
+async function fetchTelegramChunkWithRetry(botToken, chunk, proxyUrl = '', maxRetries = 3, signal) {
+    return retryChunkFetch(() => new TelegramAPI(botToken, proxyUrl).getFileContent(chunk.fileId, { signal }), maxRetries, signal);
+}
+
+async function retryChunkFetch(load, maxRetries, signal) {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
+        signal?.throwIfAborted();
         try {
-            const tgApi = new TelegramAPI(botToken, proxyUrl);
-
-            const response = await tgApi.getFileContent(chunk.fileId);
-
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-            }
-
-            // 验证分片大小是否匹配
-            const chunkData = await response.arrayBuffer();
-            const actualSize = chunkData.byteLength;
-
-            // 如果有期望大小且不匹配，抛出错误
-            if (chunk.size && actualSize !== chunk.size) {
-                console.warn(`Chunk ${chunk.index} size mismatch: expected ${chunk.size}, got ${actualSize}`);
-            }
-
-            return new Uint8Array(chunkData);
-
+            const response = await load();
+            if (response.ok) return response;
+            await response.body?.cancel();
+            throw new Error(`Chunk upstream returned ${response.status}`);
         } catch (error) {
-            console.warn(`Chunk ${chunk.index} fetch attempt ${attempt + 1} failed:`, error.message);
-
-            if (attempt === maxRetries - 1) {
-                return null; // 最后一次尝试也失败了
-            }
-
-            // 重试前等待一段时间
-            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+            signal?.throwIfAborted();
+            if (attempt + 1 === maxRetries) throw error;
+            await abortableDelay(500 * (attempt + 1), signal);
         }
     }
-
-    return null;
 }
 
 // 处理 Discord 渠道分片文件读取
@@ -524,24 +453,10 @@ async function handleDiscordChunkedFile(context, imgRecord, encodedFileName, fil
     }
 
     // 检查Range请求头
-    const range = request.headers.get('Range');
-    let rangeStart = 0;
-    let rangeEnd = totalSize - 1;
-    let isRangeRequest = false;
-
-    if (range) {
-        const matches = range.match(/bytes=(\d+)-(\d*)/);
-        if (matches) {
-            rangeStart = parseInt(matches[1]);
-            rangeEnd = matches[2] ? parseInt(matches[2]) : totalSize - 1;
-            isRangeRequest = true;
-
-            // 验证范围有效性
-            if (rangeStart >= totalSize || rangeEnd >= totalSize || rangeStart > rangeEnd) {
-                return new Response('Range Not Satisfiable', { status: 416 });
-            }
-        }
-    }
+    const selectedRange = parseByteRange(request.headers.get('Range'), totalSize);
+    if (!selectedRange) return new Response('Range Not Satisfiable', { status: 416, headers: { 'Content-Range': `bytes */${totalSize}` } });
+    const { start: rangeStart, end: rangeEnd, partial: isRangeRequest } = selectedRange;
+    if (isRangeRequest) setRangeHeaders(headers, rangeStart, rangeEnd, totalSize);
 
     // 处理HEAD请求
     if (request.method === 'HEAD') {
@@ -550,52 +465,9 @@ async function handleDiscordChunkedFile(context, imgRecord, encodedFileName, fil
 
     try {
         // 创建支持Range请求的流
-        const stream = new ReadableStream({
-            async start(controller) {
-                try {
-                    let currentPosition = 0;
-
-                    for (let i = 0; i < chunks.length; i++) {
-                        const chunk = chunks[i];
-                        const chunkSize = chunk.size || 0;
-
-                        // 如果当前分片完全在请求范围之前，跳过
-                        if (currentPosition + chunkSize <= rangeStart) {
-                            currentPosition += chunkSize;
-                            continue;
-                        }
-
-                        // 如果当前分片完全在请求范围之后，结束
-                        if (currentPosition > rangeEnd) {
-                            break;
-                        }
-
-                        // 获取分片数据（每次通过 API 获取新的附件 URL）
-                        const chunkData = await fetchDiscordChunkWithRetry(botToken, channelId, chunk, proxyUrl, 3);
-                        if (!chunkData) {
-                            throw new Error(`Failed to fetch Discord chunk ${chunk.index} after retries`);
-                        }
-
-                        // 计算在当前分片中的起始和结束位置
-                        const chunkStart = Math.max(0, rangeStart - currentPosition);
-                        const chunkEnd = Math.min(chunkSize, rangeEnd - currentPosition + 1);
-
-                        // 如果需要部分分片数据
-                        if (chunkStart > 0 || chunkEnd < chunkSize) {
-                            const partialData = chunkData.slice(chunkStart, chunkEnd);
-                            controller.enqueue(partialData);
-                        } else {
-                            controller.enqueue(chunkData);
-                        }
-
-                        currentPosition += chunkSize;
-                    }
-
-                    controller.close();
-                } catch (error) {
-                    controller.error(error);
-                }
-            }
+        const stream = createChunkedStream(chunks, {
+            start: rangeStart, end: rangeEnd, signal: request.signal,
+            fetchChunk: (chunk, signal) => fetchDiscordChunkWithRetry(botToken, channelId, chunk, proxyUrl, 3, signal),
         });
 
         // 设置Range相关头部
@@ -621,52 +493,14 @@ async function handleDiscordChunkedFile(context, imgRecord, encodedFileName, fil
 }
 
 // 带重试机制的Discord分片获取函数（每次通过 API 获取新的附件 URL）
-async function fetchDiscordChunkWithRetry(botToken, channelId, chunk, proxyUrl, maxRetries = 3) {
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-        try {
-            // 通过 Discord API 获取新的附件 URL（因为 URL 会在约24小时后过期）
-            const discordAPI = new DiscordAPI(botToken);
-            let fileUrl = await discordAPI.getFileURL(channelId, chunk.messageId);
-
-            if (!fileUrl) {
-                throw new Error('Failed to get attachment URL from Discord API');
-            }
-
-            // 如果配置了代理 URL，替换 Discord CDN 域名
-            if (proxyUrl) {
-                fileUrl = fileUrl.replace('https://cdn.discordapp.com', `https://${proxyUrl}`);
-            }
-
-            const response = await fetch(fileUrl);
-
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-            }
-
-            // 验证分片大小是否匹配
-            const chunkData = await response.arrayBuffer();
-            const actualSize = chunkData.byteLength;
-
-            // 如果有期望大小且不匹配，记录警告
-            if (chunk.size && actualSize !== chunk.size) {
-                console.warn(`Discord chunk ${chunk.index} size mismatch: expected ${chunk.size}, got ${actualSize}`);
-            }
-
-            return new Uint8Array(chunkData);
-
-        } catch (error) {
-            console.warn(`Discord chunk ${chunk.index} fetch attempt ${attempt + 1} failed:`, error.message);
-
-            if (attempt === maxRetries - 1) {
-                return null; // 最后一次尝试也失败了
-            }
-
-            // 重试前等待一段时间
-            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
-        }
-    }
-
-    return null;
+async function fetchDiscordChunkWithRetry(botToken, channelId, chunk, proxyUrl, maxRetries = 3, signal) {
+    return retryChunkFetch(async () => {
+        const discord = new DiscordAPI(botToken);
+        let fileUrl = await discord.getFileURL(channelId, chunk.messageId, { signal });
+        if (!fileUrl) throw new Error('Discord attachment URL unavailable');
+        if (proxyUrl) fileUrl = fileUrl.replace('https://cdn.discordapp.com', `https://${proxyUrl}`);
+        return fetchUpstream(fileUrl, { signal });
+    }, maxRetries, signal);
 }
 
 // 处理R2文件读取
@@ -774,12 +608,14 @@ async function handleS3File(context, metadata, encodedFileName, fileType) {
             }
 
             // 通过 CDN 获取文件（直接使用完整路径，无需拼接）
-            const response = await fetch(cdnFileUrl, {
+            const response = await fetchUpstream(cdnFileUrl, {
                 method: 'GET',
-                headers: fetchHeaders
+                headers: fetchHeaders,
+                signal: request.signal,
             });
 
             if (!response.ok && response.status !== 206) {
+                await response.body?.cancel();
                 // CDN 读取失败，回退到 S3 API
                 console.warn(`CDN fetch failed (${response.status}), falling back to S3 API`);
                 return await handleS3FileViaAPI(context, metadata, encodedFileName, fileType);
@@ -856,8 +692,9 @@ async function handleS3FileViaAPI(context, metadata, encodedFileName, fileType) 
             commandParams.Range = range;
         }
 
-        const command = new GetObjectCommand(commandParams);
-        const response = await s3Client.send(command);
+        return await requestUpstream(async signal => {
+        const command = request.method === 'HEAD' ? new HeadObjectCommand(commandParams) : new GetObjectCommand(commandParams);
+        const response = await s3Client.send(command, { abortSignal: signal });
 
         // 设置响应头
         const headers = new Headers();
@@ -884,6 +721,8 @@ async function handleS3FileViaAPI(context, metadata, encodedFileName, fileType) 
             headers
         });
 
+        }, request.signal, 30_000, () => s3Client.destroy());
+
     } catch (error) {
         return new Response(`Error: Failed to fetch from S3 - ${error.message}`, { status: 500 });
     }
@@ -901,7 +740,7 @@ async function handleDiscordFile(context, metadata, encodedFileName, fileType) {
         let fileUrl = null;
         if (discordCredentials.messageId && discordCredentials.channelId && discordCredentials.botToken) {
             const discordAPI = new DiscordAPI(discordCredentials.botToken);
-            fileUrl = await discordAPI.getFileURL(discordCredentials.channelId, discordCredentials.messageId);
+            fileUrl = await discordAPI.getFileURL(discordCredentials.channelId, discordCredentials.messageId, { signal: request.signal });
         }
 
         if (!fileUrl) {
@@ -927,12 +766,14 @@ async function handleDiscordFile(context, metadata, encodedFileName, fileType) {
             fetchHeaders['Range'] = range;
         }
 
-        const response = await fetch(fileUrl, {
+        const response = await fetchUpstream(fileUrl, {
             method: 'GET',
-            headers: fetchHeaders
+            headers: fetchHeaders,
+            signal: request.signal,
         });
 
         if (!response.ok && response.status !== 206) {
+            await response.body?.cancel();
             return new Response(`Error: Failed to fetch from Discord - ${response.status}`, { status: response.status });
         }
 
@@ -1003,12 +844,14 @@ async function handleHuggingFaceFile(context, metadata, encodedFileName, fileTyp
             fetchHeaders['Range'] = range;
         }
 
-        const response = await fetch(fileUrl, {
+        const response = await fetchUpstream(fileUrl, {
             method: 'GET',
-            headers: fetchHeaders
+            headers: fetchHeaders,
+            signal: request.signal,
         });
 
         if (!response.ok && response.status !== 206) {
+            await response.body?.cancel();
             return new Response(`Error: Failed to fetch from HuggingFace - ${response.status}`, { status: response.status });
         }
 
@@ -1060,17 +903,20 @@ async function handleWebDAVFile(context, metadata, encodedFileName, fileType) {
 
         let response;
         if (publicUrl) {
-            response = await fetch(publicUrl, {
+            response = await fetchUpstream(publicUrl, {
                 method: request.method === 'HEAD' ? 'HEAD' : 'GET',
                 headers: fetchHeaders,
+                signal: request.signal,
             });
 
             if (!response.ok && response.status !== 206 && response.status !== 304 && webdavCredentials.baseUrl && filePath) {
+                await response.body?.cancel();
                 try {
                     const webdavAPI = new WebDAVAPI(webdavCredentials);
                     response = await webdavAPI.getFile(filePath, {
                         method: request.method === 'HEAD' ? 'HEAD' : 'GET',
                         headers: fetchHeaders,
+                        signal: request.signal,
                     });
                 } catch (fallbackError) {
                     console.warn('WebDAV public URL fallback failed:', fallbackError.message);
@@ -1085,10 +931,12 @@ async function handleWebDAVFile(context, metadata, encodedFileName, fileType) {
             response = await webdavAPI.getFile(filePath, {
                 method: request.method === 'HEAD' ? 'HEAD' : 'GET',
                 headers: fetchHeaders,
+                signal: request.signal,
             });
         }
 
         if (!response.ok && response.status !== 206 && response.status !== 304) {
+            await response.body?.cancel();
             return new Response(`Error: Failed to fetch from WebDAV - ${response.status}`, { status: response.status });
         }
 

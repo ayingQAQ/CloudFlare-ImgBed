@@ -1,5 +1,7 @@
+import { chargeR2Usage, releaseR2 } from '../utils/r2Capacity.js';
+import { getUploadForm } from './uploadRequest.js';
 import { userAuthCheck, UnauthorizedResponse } from "../utils/auth/userAuth";
-import { fetchUploadConfig, fetchSecurityConfig, fetchPageConfig } from "../utils/sysConfig";
+import { fetchUploadConfig, fetchSecurityConfig, fetchPageConfig, bindRequestConfig } from "../utils/sysConfig";
 import {
     createResponse, getUploadIp, getIPAddress, resolveFileExt,
     moderateContent, purgeCDNCache, isBlockedUploadIp, buildUniqueFileId, endUpload, getImageDimensions,
@@ -17,6 +19,7 @@ import { registerPublicFile } from '../utils/publicFileId.js';
 
 
 export async function onRequest(context) {  // Contents of context object
+    bindRequestConfig(context);
     const { request, env, params, waitUntil, next, data } = context;
 
     // 解析请求的URL，存入 context
@@ -24,7 +27,7 @@ export async function onRequest(context) {  // Contents of context object
     context.url = url;
 
     // 读取各项配置，存入 context
-    const securityConfig = await fetchSecurityConfig(env);
+    const securityConfig = await fetchSecurityConfig(env, { context });
     const uploadConfig = await fetchUploadConfig(env, context);
 
     context.securityConfig = securityConfig;
@@ -80,7 +83,7 @@ async function processFileUpload(context, formdata = null) {
     const { request, url } = context;
 
     // 解析表单数据
-    formdata = formdata || await request.formData();
+    formdata = formdata || await getUploadForm(context);
 
     // 将 formdata 存储在 context 中
     context.formdata = formdata;
@@ -203,7 +206,7 @@ async function processFileUpload(context, formdata = null) {
     }
 
     // 构建公开访问链接（使用 urlPrefix 配置）
-    const pageConfig = await fetchPageConfig(context.env);
+    const pageConfig = await fetchPageConfig(context.env, context);
     const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
     const urlPrefix = urlPrefixConfig?.value || '';
     context.publicUrl = urlPrefix ? `${urlPrefix.replace(/\/+$/, '')}/${fullId}` : '';
@@ -327,7 +330,12 @@ async function uploadFileToCloudflareR2(context, fullId, metadata, returnLink) {
     const R2DataBase = env.img_r2;
 
     // 写入R2数据库
+    const bypassReservation = !context.data?.r2Reservation
+        ? await chargeR2Usage(R2DataBase, formdata.get('file').size) : null;
     await R2DataBase.put(fullId, formdata.get('file'));
+    context.data ||= {};
+    context.data.r2ObjectCommitted = true;
+    if (bypassReservation) await releaseR2(R2DataBase, bypassReservation, { committed: true });
 
     // 更新metadata
     metadata.Channel = "CloudflareR2";
@@ -336,7 +344,7 @@ async function uploadFileToCloudflareR2(context, fullId, metadata, returnLink) {
     // 图像审查，采用R2的publicUrl
     const R2PublicUrl = r2Channel.publicUrl;
     let moderateUrl = `${R2PublicUrl}/${fullId}`;
-    metadata.Label = await moderateContent(env, moderateUrl);
+    metadata.Label = await moderateContent(env, moderateUrl, context);
 
     // 写入数据库
     try {
@@ -430,7 +438,7 @@ async function uploadFileToS3(context, fullId, metadata, returnLink) {
 
             const moderateUrl = `https://${url.hostname}/file/${fullId}`;
             await purgeCDNCache(env, moderateUrl, url);
-            metadata.Label = await moderateContent(env, moderateUrl);
+            metadata.Label = await moderateContent(env, moderateUrl, context);
         }
 
         // 写入数据库
@@ -542,7 +550,7 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
         // 图像审查（使用代理域名或官方域名）
         const moderateDomain = tgProxyUrl ? `https://${tgProxyUrl}` : 'https://api.telegram.org';
         const moderateUrl = `${moderateDomain}/file/bot${tgBotToken}/${filePath}`;
-        metadata.Label = await moderateContent(env, moderateUrl);
+        metadata.Label = await moderateContent(env, moderateUrl, context);
 
         // 更新metadata，写入KV数据库
         try {
@@ -663,7 +671,7 @@ async function uploadFileToDiscord(context, fullId, metadata, returnLink) {
         if (discordChannel.proxyUrl) {
             moderateUrl = fileInfo.url.replace('https://cdn.discordapp.com', `https://${discordChannel.proxyUrl}`);
         }
-        metadata.Label = await moderateContent(env, moderateUrl);
+        metadata.Label = await moderateContent(env, moderateUrl, context);
 
         // 写入 KV 数据库
         try {
@@ -740,7 +748,7 @@ async function uploadFileToHuggingFace(context, fullId, metadata, returnLink) {
         : `${fullId.substring(0, lastSlashIndex + 1)}${uniquePrefix}_${fullId.substring(lastSlashIndex + 1)}`;
     console.log('HuggingFace file path:', hfFilePath);
 
-    const huggingfaceAPI = new HuggingFaceAPI(hfChannel.token, hfChannel.repo, hfChannel.isPrivate || false);
+    const huggingfaceAPI = new HuggingFaceAPI(hfChannel.token, hfChannel.repo, hfChannel.isPrivate || false, env);
 
     try {
         // 上传文件到 HuggingFace（传入预计算的 SHA256）
@@ -764,7 +772,7 @@ async function uploadFileToHuggingFace(context, fullId, metadata, returnLink) {
         if (uploadModerate && uploadModerate.enabled) {
             if (!hfChannel.isPrivate) {
                 // 公开仓库：直接通过公开URL访问进行审查，只写入1次KV
-                metadata.Label = await moderateContent(env, result.fileUrl);
+                metadata.Label = await moderateContent(env, result.fileUrl, context);
             } else {
                 // 私有仓库：先写入KV，再通过自己的域名访问进行审查
                 try {
@@ -775,7 +783,7 @@ async function uploadFileToHuggingFace(context, fullId, metadata, returnLink) {
                 
                 const moderateUrl = `https://${context.url.hostname}/file/${fullId}`;
                 await purgeCDNCache(env, moderateUrl, context.url);
-                metadata.Label = await moderateContent(env, moderateUrl);
+                metadata.Label = await moderateContent(env, moderateUrl, context);
             }
         }
 
@@ -794,7 +802,7 @@ async function uploadFileToHuggingFace(context, fullId, metadata, returnLink) {
 
     } catch (error) {
         console.error('HuggingFace upload error:', error.message);
-        return createResponse(`Error: HuggingFace upload failed - ${error.message}`, { status: 500 });
+        return createResponse(`Error: HuggingFace upload failed - ${error.message}`, { status: error.status === 429 ? 429 : 500, headers: error.retryAfter ? { 'Retry-After': error.retryAfter } : {} });
     }
 }
 
@@ -843,7 +851,7 @@ async function uploadFileToWebDAV(context, fullId, metadata, returnLink) {
         const uploadModerate = securityConfig.upload?.moderate;
         if (uploadModerate && uploadModerate.enabled) {
             if (webdavPublicUrl) {
-                metadata.Label = await moderateContent(env, webdavPublicUrl);
+                metadata.Label = await moderateContent(env, webdavPublicUrl, context);
             } else {
                 try {
                     await db.put(fullId, "", { metadata });
@@ -853,7 +861,7 @@ async function uploadFileToWebDAV(context, fullId, metadata, returnLink) {
 
                 const moderateUrl = `https://${url.hostname}/file/${fullId}`;
                 await purgeCDNCache(env, moderateUrl, url);
-                metadata.Label = await moderateContent(env, moderateUrl);
+                metadata.Label = await moderateContent(env, moderateUrl, context);
             }
         }
 
