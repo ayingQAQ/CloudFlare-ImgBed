@@ -31,6 +31,12 @@ async function handleBackup(env) {
     const configuredBytes = Number(env.BACKUP_JSON_MAX_BYTES);
     const maxBytes = Number.isSafeInteger(configuredBytes) && configuredBytes > 0
         ? Math.min(configuredBytes, 64 * 1024 * 1024) : 16 * 1024 * 1024;
+    // Old immutable index generations are rebuildable cache, not live metadata.
+    // Export the active generation in the same transaction, rather than allowing
+    // retired snapshots to exhaust the backup budget after routine uploads.
+    const source = table => table !== 'settings' ? table : `(SELECT * FROM settings WHERE
+        key NOT GLOB 'manage@index_*' OR
+        key GLOB ('manage@index_' || COALESCE((SELECT json_extract(value, '$.generation') || '_' FROM settings WHERE key = 'manage@index@meta'), '') || '[0-9]*'))`;
     const quoteName = value => `"${value.replaceAll('"', '""')}"`;
     const quoteText = value => `'${value.replaceAll("'", "''")}'`;
     // Only schema metadata is read outside the snapshot transaction. Include
@@ -49,7 +55,7 @@ async function handleBackup(env) {
         // Compute lengths in SQL; never hydrate the potentially oversized rows.
         const sizes = columns[index].map(column =>
             `(6 * COALESCE(length(CAST(${quoteName(column)} AS BLOB)), 0) + ${6 * new TextEncoder().encode(column).byteLength + 24})`).join(' + ');
-        return `SELECT COUNT(*) AS row_count, COALESCE(SUM(${sizes}), 0) AS byte_count FROM (SELECT ${columns[index].map(quoteName).join(', ')} FROM ${table} LIMIT ${maxRows + 1})`;
+        return `SELECT COUNT(*) AS row_count, COALESCE(SUM(${sizes}), 0) AS byte_count FROM (SELECT ${columns[index].map(quoteName).join(', ')} FROM ${source(table)} LIMIT ${maxRows + 1})`;
     });
     const admission = `WITH backup_totals AS (
         SELECT SUM(row_count) AS row_count, SUM(byte_count) AS byte_count FROM (${estimates.join(' UNION ALL ')})
@@ -62,7 +68,7 @@ async function handleBackup(env) {
     // on opposite sides of a concurrent move/upload. Every SELECT checks the
     // same snapshot budget, so an oversized database returns zero payload rows.
     const statements = [env.img_d1.prepare(`${admission} SELECT * FROM backup_gate`),
-        ...tables.map((table, index) => env.img_d1.prepare(`${admission} SELECT ${columns[index].map(quoteName).join(', ')} FROM ${table} WHERE (SELECT admitted FROM backup_gate) = 1`))];
+        ...tables.map((table, index) => env.img_d1.prepare(`${admission} SELECT ${columns[index].map(quoteName).join(', ')} FROM ${source(table)} WHERE (SELECT admitted FROM backup_gate) = 1`))];
     const results = await env.img_d1.batch(statements);
     const gate = results[0]?.results?.[0];
     if (!gate) throw new Error('Backup admission result missing');

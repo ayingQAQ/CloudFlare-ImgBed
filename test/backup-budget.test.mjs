@@ -86,3 +86,14 @@ test('workerd D1 supports SQL admission for both small and oversized snapshots',
     assert.equal(large.status, 413);
     assert.match((await large.json()).error, /native D1 export/);
 });
+
+test('backup excludes retired index generations but retains active chunks and metadata', async t => {
+ const { db, adapter } = database(t);
+ const put=db.prepare('INSERT INTO settings (key,value) VALUES (?,?)');
+ put.run('manage@index@meta',JSON.stringify({generation:'active',chunkCount:1,totalCount:1}));
+ put.run('manage@index_active_0','[{"id":"file"}]');
+ put.run('manage@index_old_0','x'.repeat(4*1024*1024));
+ const response=await backup(adapter);assert.equal(response.status,200);
+ const keys=(await response.json()).tables.settings.map(row=>row.key);
+ assert(keys.includes('manage@index_active_0'));assert(keys.includes('manage@index@meta'));assert(!keys.includes('manage@index_old_0'));
+});
