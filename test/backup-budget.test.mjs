@@ -81,6 +81,15 @@ test('workerd D1 supports SQL admission for both small and oversized snapshots',
     const small = await request();
     assert.equal(small.status, 200);
     assert.equal((await small.json()).tables.settings[0].value, 'saved');
+    const generation = '1790362452885-22c12345-1234-1234-1234-123456789012';
+    await db.prepare('INSERT INTO settings VALUES (?, ?)').bind('manage@index@meta', JSON.stringify({generation})).run();
+    await db.prepare('INSERT INTO settings VALUES (?, ?)').bind(`manage@index_${generation}_0`, '[]').run();
+    await db.prepare('INSERT INTO settings VALUES (?, ?)').bind('manage@index_obsolete_0', '[]').run();
+    const versioned = await request();
+    assert.equal(versioned.status, 200);
+    const snapshot = await versioned.json();
+    assert(snapshot.tables.settings.some(row => row.key === `manage@index_${generation}_0`));
+    assert(!snapshot.tables.settings.some(row => row.key === 'manage@index_obsolete_0'));
     await db.batch(Array.from({ length: 16 }, (_, index) => db.prepare('INSERT INTO settings VALUES (?, ?)').bind(String(index), 'x'.repeat(200_000))));
     const large = await request();
     assert.equal(large.status, 413);

@@ -34,9 +34,9 @@ async function handleBackup(env) {
     // Old immutable index generations are rebuildable cache, not live metadata.
     // Export the active generation in the same transaction, rather than allowing
     // retired snapshots to exhaust the backup budget after routine uploads.
-    const source = table => table !== 'settings' ? table : `(SELECT * FROM settings WHERE
-        key NOT GLOB 'manage@index_*' OR
-        key GLOB ('manage@index_' || COALESCE((SELECT json_extract(value, '$.generation') || '_' FROM settings WHERE key = 'manage@index@meta'), '') || '[0-9]*'))`;
+    const source = table => table !== 'settings' ? table : `(SELECT s.* FROM settings s CROSS JOIN
+        (SELECT 'manage@index_' || COALESCE((SELECT json_extract(value, '$.generation') || '_' FROM settings WHERE key = 'manage@index@meta'), '') AS active_prefix) idx
+        WHERE substr(s.key, 1, 13) != 'manage@index_' OR substr(s.key, 1, length(idx.active_prefix)) = idx.active_prefix)`;
     const quoteName = value => `"${value.replaceAll('"', '""')}"`;
     const quoteText = value => `'${value.replaceAll("'", "''")}'`;
     // Only schema metadata is read outside the snapshot transaction. Include
