@@ -42,6 +42,7 @@ import * as apiAuthSessionCheck from '../../functions/api/auth/sessionCheck.js';
 import * as apiBingWallpaper_index from '../../functions/api/bing/wallpaper/index.js';
 import * as apiManageApiTokens from '../../functions/api/manage/apiTokens.js';
 import * as apiManageDirectories from '../../functions/api/manage/directories.js';
+import * as apiManageDirectoryLink from '../../functions/api/manage/directoryLink.js';
 import * as apiManageList from '../../functions/api/manage/list.js';
 import * as apiManageQuota from '../../functions/api/manage/quota.js';
 import * as apiManageTelegramBackup from '../../functions/api/manage/telegramBackup.js';
@@ -99,6 +100,7 @@ const routes = [
     { path: '/api/bing/wallpaper', module: apiBingWallpaper_index, middlewares: [mw_api] },
     { path: '/api/manage/apiTokens', module: apiManageApiTokens, middlewares: [mw_api, mw_api_manage] },
     { path: '/api/manage/directories', module: apiManageDirectories, middlewares: [mw_api, mw_api_manage] },
+    { path: '/api/manage/directoryLink', module: apiManageDirectoryLink, middlewares: [mw_api, mw_api_manage] },
     { path: '/api/manage/list', module: apiManageList, middlewares: [mw_api, mw_api_manage] },
     { path: '/api/manage/quota', module: apiManageQuota, middlewares: [mw_api, mw_api_manage] },
     { path: '/api/manage/telegramBackup', module: apiManageTelegramBackup, middlewares: [mw_api, mw_api_manage] },

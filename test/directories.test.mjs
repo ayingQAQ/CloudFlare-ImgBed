@@ -1,6 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { directoryPath, saveDirectory, savedDirectories, mergeDirectories, changeDirectories } from '../functions/utils/directories.js';
+import { onRequest as directoryLink } from '../functions/api/manage/directoryLink.js';
+
+test('opaque directory links persist across backends without listing or exposing names', async () => {
+    const records = new Map();
+    let writes = 0;
+    const env = { img_url: {
+        get: async key => records.get(key),
+        put: async (key, value) => { writes++; records.set(key, value); },
+        list: () => { throw new Error('Must not list'); }
+    } };
+    const call = (method, body, query = '') => directoryLink({ env,
+        request: new Request('https://test/api/manage/directoryLink' + query, {
+            method, ...(body === undefined ? {} : { body: JSON.stringify(body) })
+        }) });
+    const path = '照片/Yeha+_예하_ & [158P_4V-5.75GB]';
+    const response = await call('POST', { path });
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const { id } = await response.json();
+    assert.match(id, /^d_[a-f0-9]{64}$/);
+    assert.equal((await (await call('POST', { path: '/' + path + '/' })).json()).id, id);
+    assert.equal(writes, 1);
+    assert.equal((await (await call('GET', undefined, '?id=' + id)).json()).path, path);
+    assert.equal((await call('GET', undefined, '?id=d_' + '0'.repeat(64))).status, 404);
+    assert.equal((await call('GET', undefined, '?id=../secret')).status, 400);
+    assert.equal((await call('POST', { path: '../secret' })).status, 400);
+});
 
 test('empty nested folders persist, list once, move and delete with their parent', async () => {
     const records = new Map();
