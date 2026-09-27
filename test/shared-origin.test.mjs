@@ -4,6 +4,21 @@ import gateway from '../deploy/worker/state-gateway.js';
 import { RemoteR2Storage } from '../deploy/server/remoteR2.js';
 import { syncOriginChannels, ORIGIN_CHANNEL_KEY } from '../functions/utils/originChannels.js';
 import { publicRequest } from '../deploy/server/public-request.js';
+import routesWorker from '../deploy/worker/routes-entry.js';
+import applicationWorker from '../deploy/worker/index.js';
+
+test('origin-owned maintenance skips heavy edge jobs; other deployments retain them', async () => {
+    const original = applicationWorker.scheduled;
+    let runs = 0;
+    applicationWorker.scheduled = async () => { runs++; };
+    try {
+        await routesWorker.scheduled({}, { MAINTENANCE_OWNER: 'origin', ORIGIN_STATE_READY: 'true' }, {});
+        assert.equal(runs, 0);
+        await routesWorker.scheduled({}, { ORIGIN_STATE_READY: 'true' }, {});
+        await routesWorker.scheduled({}, { MAINTENANCE_OWNER: 'origin', ORIGIN_STATE_READY: 'false' }, {});
+        assert.equal(runs, 2);
+    } finally { applicationWorker.scheduled = original; }
+});
 
 test('backup reads all metadata tables in one D1 transaction', async () => {
     let calls = 0;

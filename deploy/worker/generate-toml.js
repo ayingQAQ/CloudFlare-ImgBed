@@ -47,6 +47,7 @@ binding = "IMAGES"
 [vars]
 ORIGIN_FALLBACK_MODE = "routes"
 ORIGIN_STATE_READY = "true"
+MAINTENANCE_OWNER = "origin"
 ORIGIN_BASE_URL = ${q(config.origin)}
 [[d1_databases]]
 binding = "img_d1"

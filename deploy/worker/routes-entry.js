@@ -6,6 +6,9 @@ import { withOriginFallback } from './origin-fallback.js';
 export default {
     async scheduled(event, env, ctx) {
         await syncOriginChannels(env);
+        // The verified origin already runs the same maintenance every minute.
+        // Do not duplicate index/backup work within the edge CPU budget.
+        if (env.MAINTENANCE_OWNER === 'origin' && env.ORIGIN_STATE_READY === 'true') return;
         return application.scheduled?.(event, env, ctx);
     },
     fetch(request, env, ctx) {
