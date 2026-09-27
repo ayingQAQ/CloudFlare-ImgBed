@@ -87,6 +87,10 @@ export async function resolveAutomaticPrimary(context, request = context.request
     const config = await fetchUploadConfig(context.env, context);
     const r2 = config.cfr2?.channels || [];
     const hf = config.huggingface?.channels || [];
+    if (context.anonymousUpload) {
+        return { channel: hf.length ? 'huggingface' : null,
+            reason: hf.length ? 'guest_default_huggingface' : 'guest_huggingface_unavailable' };
+    }
     const policy = getTieringPolicy(context.env, r2);
     const incomingBytes = Math.ceil(await estimateIncomingBytes(context, request, new URL(request.url)));
     if (context.env.img_r2 && r2.length) {

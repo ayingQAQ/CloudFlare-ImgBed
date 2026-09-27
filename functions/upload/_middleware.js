@@ -101,6 +101,7 @@ async function applyStorageTiering(context) {
     let anonymousReservation;
     const admin = await authenticate({ env: context.env, request: originalRequest, url: originalUrl, requiredPermission: 'upload', authScope: AUTH_SCOPE.ADMIN });
     const isAnonymous = !admin.authorized;
+    context.anonymousUpload = isAnonymous;
     if (isChunkPart || isMerge) {
         const form = await getUploadForm(context, originalRequest);
         const session = JSON.parse(await getDatabase(context.env).get(`upload_session_${form.get('uploadId')}`) || 'null');
@@ -158,7 +159,9 @@ async function applyStorageTiering(context) {
                 error: decision.reason,
                 message: decision.reason === 'r2_threshold_reached_hf_unavailable'
                     ? 'R2 已达到安全阈值，但 Hugging Face 未配置或不可用。请配置 Hugging Face；如确需强制写入 R2，API 请求可显式使用 tiering=off。'
-                    : '没有可用的主存储渠道，请至少配置 R2 或 Hugging Face。',
+                    : decision.reason === 'guest_huggingface_unavailable'
+                        ? '访客上传的 Hugging Face 渠道暂不可用，请稍后重试。'
+                        : '没有可用的主存储渠道，请至少配置 R2 或 Hugging Face。',
                 tiering: decision,
             };
             await finishAnonymousUpload(context.env.img_r2, originalRequest, anonymousReservation, false);
@@ -179,7 +182,7 @@ async function applyStorageTiering(context) {
             return new Response(JSON.stringify({
                 success: false,
                 error: 'hf_direct_upload_required',
-                message: 'R2 已达到安全阈值，大文件请改用 Hugging Face 直传流程。',
+                message: '当前上传使用 Hugging Face，大文件请使用直传流程。',
                 tiering: decision,
             }), {
                 status: 409,

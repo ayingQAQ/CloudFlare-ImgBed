@@ -76,6 +76,21 @@ for (const backend of ['docker', 'workerd']) {
     });
 }
 
+test('guest automatic routing prefers HF without reserving R2; administrators retain R2', async t => {
+    const { env } = environment(local(t));
+    const form = new FormData(); form.set('file', new Blob(['guest']), 'x.png');
+    const request = new Request('https://test/upload', { method: 'POST', body: form });
+    const result = await resolveAutomaticPrimary({ env, request, anonymousUpload: true });
+    assert.equal(result.channel, 'huggingface');
+    assert.equal(result.reservationId, undefined);
+    assert.equal(await env.img_r2.get('.imgbed-internal/capacity.json'), null);
+    const admin = await resolveAutomaticPrimary({ env, request: request.clone() });
+    assert.equal(admin.channel, 'cfr2');
+    await releaseR2(env.img_r2, admin.reservationId);
+    delete env.HF_TOKEN;
+    assert.equal((await resolveAutomaticPrimary({ env, request, anonymousUpload: true })).channel, null);
+});
+
 test('routing switches R2 UI selection to HF; unavailable HF fails closed', async t => {
     const { env } = environment(local(t));
     env.R2_AUTO_TIER_LIMIT_GB = '0.002';
