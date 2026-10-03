@@ -60,6 +60,7 @@ export async function getTelegramBackup(env, fileId, metadata) {
 }
 
 export async function enqueueTelegramBackup(context, fileId, primaryChannel) {
+    if (String(context.env.TG_BACKUP_ENABLED).toLowerCase() === 'false') return;
     if (!['cfr2', 'huggingface'].includes(primaryChannel)) return;
     const bucket = context.env.img_r2;
     if (!bucket) throw new Error('R2 binding is required for durable Telegram backup jobs');
@@ -214,6 +215,7 @@ async function sendTelegramPreview(env, job, config, channel, signal) {
 // Claim it before reading source bytes or constructing a preview. A crashed worker
 // loses the lease; a live worker cancels I/O before the lease can expire.
 export async function processTelegramBackup(env, id) {
+    if (String(env.TG_BACKUP_ENABLED).toLowerCase() === 'false') return;
     const bucket = env.img_r2;
     const previous = await bucket.get(WORKER_SLOT);
     const slot = previous ? await json(previous) : null;
@@ -322,6 +324,7 @@ async function processClaimedBackup(env, id, signal) {
 }
 
 export async function drainTelegramBackups(env, maxSteps = 10) {
+    if (String(env.TG_BACKUP_ENABLED).toLowerCase() === 'false') return 0;
     if (!env.img_r2) return 0;
     const savedCursor = await env.img_r2.get(CURSOR);
     const cursor = savedCursor ? (await json(savedCursor)).cursor : null;

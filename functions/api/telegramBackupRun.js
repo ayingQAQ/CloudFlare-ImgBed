@@ -15,6 +15,10 @@ export async function onRequestPost(context) {
     const fileId = url.searchParams.get('fileId');
     const runner = await equalSecret(request.headers.get('Authorization')?.replace(/^Bearer /, ''), env.TG_BACKUP_RUNNER_TOKEN);
     if (!runner && (!fileId || !await userAuthCheck(env, url, request, 'upload'))) return UnauthorizedResponse('Unauthorized');
+    if (fileId && String(env.TG_BACKUP_ENABLED).toLowerCase() === 'false') {
+        return Response.json({ status: 'cancelled', backupDisabled: true },
+            { headers: { 'Cache-Control': 'no-store' } });
+    }
     if (!env.img_r2) return Response.json({ error: 'R2 binding is required' }, { status: 503 });
     if (!fileId) {
         await runMaintenance(env);
